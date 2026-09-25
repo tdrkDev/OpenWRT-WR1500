@@ -7,6 +7,7 @@
 #define _BOARD_H_
 
 unsigned int board_get_memory(void);
+void board_init(void);
 void board_get_system(char *buffer, int len);
 void board_panic(void);
 void board_putchar(int ch, void *ctx);;

@@ -19,6 +19,8 @@
 # KERNEL_IMG_OUT:	The filename of the kernel image with the rt-loader prepended.
 #			If not given it will be created as image.bin into the BUILD_DIR.
 # BUILD_DIR:		The temporary build dir. If not given it will be set to "build".
+# RT_LOADER_SOC:	Set to rtl8197f to build for the little endian RTL8197F router
+#			SoC instead of the RTL83xx/RTL93xx switch SoCs.
 #
 # To add it into the OpenWrt toolchain just create the following new build commands
 #
@@ -76,6 +78,9 @@ OBJDUMP		:= $(CROSS_COMPILE)objdump
 CFLAGS		= -fpic -mabicalls -O3 -fno-builtin-printf -Iinclude
 CFLAGS		+= -DFLASH_ADDR=$(FLASH_ADDR)
 CFLAGS		+= -DKERNEL_ADDR=$(KERNEL_ADDR)
+ifeq ($(RT_LOADER_SOC),rtl8197f)
+CFLAGS		+= -DSOC_RTL8197F
+endif
 
 ASFLAGS		= -fpic -msoft-float -Iinclude
 

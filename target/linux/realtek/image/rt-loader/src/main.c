@@ -205,6 +205,7 @@ void main(unsigned long reg_a0, unsigned long reg_a1,
 	 * first run and have them at hand after relocation.
 	 */
 	if (_my_run_count == 1) {
+		board_init();
 		welcome();
 		fn = relocate(_my_load_addr, _my_load_size);
 		fn(reg_a0, reg_a1, reg_a2, reg_a3);
