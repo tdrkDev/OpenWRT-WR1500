@@ -32,7 +32,8 @@ typedef enum rtl8367b_chip_e {
 	RTL8367B_CHIP_RTL8367RB_VB,
 	RTL8367B_CHIP_RTL8367S,
 /* Family D */
-	RTL8367B_CHIP_RTL8367S_VB /* chip with exception in extif assignment */
+	RTL8367B_CHIP_RTL8367S_VB, /* chip with exception in extif assignment */
+	RTL8367B_CHIP_RTL8367RB_VC,
 } rtl8367b_chip_t;
 
 struct rtl8366_mib_counter {

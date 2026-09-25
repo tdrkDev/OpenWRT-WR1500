@@ -550,8 +550,8 @@ static int rtl8367b_write_phy_reg(struct rtl8366_smi *smi,
 
 static int rtl8367b_init_regs(struct rtl8366_smi *smi)
 {
-	const struct rtl8367b_initval *initvals;
-	int count;
+	const struct rtl8367b_initval *initvals = NULL;
+	int count = 0;
 
 	switch (smi->rtl8367b_chip) {
 	case RTL8367B_CHIP_RTL8367RB:
@@ -562,9 +562,16 @@ static int rtl8367b_init_regs(struct rtl8366_smi *smi)
 	case RTL8367B_CHIP_RTL8367RB_VB:
 	case RTL8367B_CHIP_RTL8367S:
 	case RTL8367B_CHIP_RTL8367S_VB:
-		initvals = rtl8367c_initvals;
-		count = ARRAY_SIZE(rtl8367c_initvals);
-		if ((smi->rtl8367b_chip == RTL8367B_CHIP_RTL8367S_VB) && (smi->emu_vlanmc == NULL)) {
+	case RTL8367B_CHIP_RTL8367RB_VC:
+		/*
+		 * The vendor driver does not initialize the RTL8367RB-VC beyond
+		 * reset, the RTL8367C values break gigabit links on it.
+		 */
+		if (smi->rtl8367b_chip != RTL8367B_CHIP_RTL8367RB_VC) {
+			initvals = rtl8367c_initvals;
+			count = ARRAY_SIZE(rtl8367c_initvals);
+		}
+		if ((smi->rtl8367b_chip >= RTL8367B_CHIP_RTL8367S_VB) && (smi->emu_vlanmc == NULL)) {
 			smi->emu_vlanmc = kzalloc(sizeof(struct rtl8366_vlan_mc) * smi->num_vlan_mc, GFP_KERNEL);
 			if (!smi->emu_vlanmc) {
 				dev_err(smi->parent, "failed to allocate vlan mc emulator\n");
@@ -669,7 +676,7 @@ static int rtl8367b_extif_set_mode(struct rtl8366_smi *smi, int id,
 					RTL8367B_DEBUG1_DP_MASK(id),
 				(7 << RTL8367B_DEBUG1_DN_SHIFT(id)) |
 					(7 << RTL8367B_DEBUG1_DP_SHIFT(id)));
-			if ((smi->rtl8367b_chip == RTL8367B_CHIP_RTL8367S_VB) && (id == 1)) {
+			if ((smi->rtl8367b_chip >= RTL8367B_CHIP_RTL8367S_VB) && (id == 1)) {
 				REG_RMW(smi, RTL8367D_REG_EXT_TXC_DLY, RTL8367D_EXT1_RGMII_TX_DLY_MASK, 0);
 				/* Configure RGMII/MII mux to port 7 if UTP_PORT4 is not RGMII mode */
 				REG_RD(smi, RTL8367D_REG_TOP_CON0, &data);
@@ -840,7 +847,7 @@ static int rtl8367b_extif_init_of(struct rtl8366_smi *smi,
 				err = -EINVAL;
 				goto err_init;
 			}
-		} else if (smi->rtl8367b_chip == RTL8367B_CHIP_RTL8367S_VB) { /* for the RTL8367S-VB chip, cpu_port 7 corresponds to extif1, cpu_port 6 corresponds to extif0 */
+		} else if (smi->rtl8367b_chip >= RTL8367B_CHIP_RTL8367S_VB) { /* for family D chips, cpu_port 7 corresponds to extif1, cpu_port 6 corresponds to extif0 */
 			if (cpu_port != RTL8367B_CPU_PORT_NUM) {
 				id = cpu_port - RTL8367B_CPU_PORT_NUM - 1;
 			} else {
@@ -1531,6 +1538,12 @@ static int rtl8367b_detect(struct rtl8366_smi *smi)
 		if (chip_num == 0x6642) {
 			chip_name = "8367S-VB";
 			smi->rtl8367b_chip = RTL8367B_CHIP_RTL8367S_VB;
+		}
+		break;
+	case 0x0030:
+		if (chip_num == 0x6642) {
+			chip_name = "8367RB-VC";
+			smi->rtl8367b_chip = RTL8367B_CHIP_RTL8367RB_VC;
 		}
 		break;
 	case 0x0020:
