@@ -8,8 +8,7 @@ rtl8197f_setup_interfaces()
 
 	case $board in
 	cudy,wr1500)
-		ucidef_add_switch "switch0" \
-			"3:lan:1" "0:lan:2" "1:lan:3" "2:wan" "7@eth0"
+		ucidef_set_interfaces_lan_wan "lan1 lan2 lan3" "wan"
 		;;
 	*)
 		ucidef_set_interface_lan "eth0"

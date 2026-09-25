@@ -46,16 +46,81 @@
 	};
 
 	/*
-	 * RTL8367 family switch (chip number 0x6642) managed via SMI on GPIO 56
-	 * (H0, clock) and GPIO 55 (G7, data), CPU port is MAC7 (RGMII).
+	 * RTL8367RB-VC switch managed via SMI on GPIO 56 (H0, clock) and GPIO 55
+	 * (G7, data). Its CPU port 7 (RGMII) connects to port 0 of the SoC switch
+	 * core, which handles the 4 byte CPU tag in hardware.
 	 */
 	switch {
-		compatible = "realtek,rtl8367b";
+		compatible = "realtek,rtl8365mb";
 		pinctrl-names = "default";
 		pinctrl-0 = <&pinmux_smi>;
-		sck-gpios = <&gpio1 24 GPIO_ACTIVE_HIGH>;
-		sda-gpios = <&gpio1 23 GPIO_ACTIVE_HIGH>;
-		realtek,extif = <7 0 2 1 1 1 1 1 1 2>;
+		mdc-gpios = <&gpio1 24 GPIO_ACTIVE_HIGH>;
+		mdio-gpios = <&gpio1 23 GPIO_ACTIVE_HIGH>;
+		realtek,short-cpu-tag;
+
+		mdio {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			phy0: ethernet-phy@0 {
+				reg = <0>;
+			};
+
+			phy1: ethernet-phy@1 {
+				reg = <1>;
+			};
+
+			phy2: ethernet-phy@2 {
+				reg = <2>;
+			};
+
+			phy3: ethernet-phy@3 {
+				reg = <3>;
+			};
+		};
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				label = "lan2";
+				phy-handle = <&phy0>;
+			};
+
+			port@1 {
+				reg = <1>;
+				label = "lan3";
+				phy-handle = <&phy1>;
+			};
+
+			port@2 {
+				reg = <2>;
+				label = "wan";
+				phy-handle = <&phy2>;
+			};
+
+			port@3 {
+				reg = <3>;
+				label = "lan1";
+				phy-handle = <&phy3>;
+			};
+
+			port@7 {
+				reg = <7>;
+				ethernet = <&ethernet0>;
+				phy-mode = "rgmii";
+				rx-internal-delay-ps = <600>;
+				tx-internal-delay-ps = <0>;
+
+				fixed-link {
+					speed = <1000>;
+					full-duplex;
+					pause;
+				};
+			};
+		};
 	};
 
 	leds {
@@ -78,6 +143,7 @@
 &ethernet0 {
 	nvmem-cells = <&macaddr_cfg_7>;
 	nvmem-cell-names = "mac-address";
+	realtek,cpu-tag;
 
 	status = "okay";
 };

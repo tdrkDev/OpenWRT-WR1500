@@ -25,7 +25,7 @@ define Device/cudy_wr1500
   DEVICE_VENDOR := Cudy
   DEVICE_MODEL := WR1500
   SUPPORTED_DEVICES += R76
-  DEVICE_PACKAGES := kmod-switch-rtl8367b swconfig -uboot-envtools
+  DEVICE_PACKAGES := kmod-dsa-rtl8365mb -uboot-envtools
   IMAGES :=
 endef
 TARGET_DEVICES += cudy_wr1500
