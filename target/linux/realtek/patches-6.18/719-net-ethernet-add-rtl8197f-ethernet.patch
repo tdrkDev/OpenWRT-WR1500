@@ -1,0 +1,36 @@
+From: Roman Rikhter <teledurak@gmail.com>
+Subject: [PATCH] net: ethernet: add Realtek RTL8197F switch core driver
+
+Add Kconfig and Makefile entries for the driver of the CPU port of the
+switch core in Realtek RTL8197F router SoCs.
+
+Signed-off-by: Roman Rikhter <teledurak@gmail.com>
+---
+Index: linux-6.18.52/drivers/net/ethernet/realtek/Kconfig
+===================================================================
+--- linux-6.18.52.orig/drivers/net/ethernet/realtek/Kconfig
++++ linux-6.18.52/drivers/net/ethernet/realtek/Kconfig
+@@ -146,6 +146,14 @@ config NET_RTL838X
+ 	help
+ 	  Say Y here if you want to use the Realtek rtl838x Gbps Ethernet MAC.
+ 
++config NET_RTL8197F
++	tristate "Realtek RTL8197F switch core Ethernet support"
++	depends on MACH_REALTEK_RTL || COMPILE_TEST
++	depends on OF
++	help
++	  Say Y here to use the CPU port of the switch core in Realtek
++	  RTL8197F router SoCs.
++
+ config NET_RTL960X_GMAC
+ 	tristate "Realtek RTL960X Ethernet MAC support"
+ 	depends on RTL960X
+Index: linux-6.18.52/drivers/net/ethernet/realtek/Makefile
+===================================================================
+--- linux-6.18.52.orig/drivers/net/ethernet/realtek/Makefile
++++ linux-6.18.52/drivers/net/ethernet/realtek/Makefile
+@@ -12,3 +12,4 @@ obj-$(CONFIG_R8169) += r8169.o
+ obj-$(CONFIG_RTASE) += rtase/
+ obj-$(CONFIG_NET_RTL838X) += rtl838x_eth.o
+ obj-$(CONFIG_NET_RTL960X_GMAC) += rtl960x_gmac.o
++obj-$(CONFIG_NET_RTL8197F) += rtl8197f_eth.o
