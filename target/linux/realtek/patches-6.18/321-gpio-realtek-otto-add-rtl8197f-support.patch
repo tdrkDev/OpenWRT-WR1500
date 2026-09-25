@@ -1,0 +1,39 @@
+From: Roman Rikhter <teledurak@gmail.com>
+Subject: [PATCH] gpio: realtek-otto: add RTL8197F support
+
+The RTL8197F router SoC has the GPIO block the Otto switch SoCs derive
+from: two banks of four 8-bit ports (A-D at 0x3500, E-H at 0x351c) with
+the same CNR, DIR, DATA, ISR and IMR registers. The CPU runs little
+endian and port A is held in the least significant byte, with two IMR
+bits per line starting at bit 0. This matches the reversed port order
+handling of the driver, so reuse it.
+
+Signed-off-by: Roman Rikhter <teledurak@gmail.com>
+---
+Index: linux-6.18.52/Documentation/devicetree/bindings/gpio/realtek,otto-gpio.yaml
+===================================================================
+--- linux-6.18.52.orig/Documentation/devicetree/bindings/gpio/realtek,otto-gpio.yaml
++++ linux-6.18.52/Documentation/devicetree/bindings/gpio/realtek,otto-gpio.yaml
+@@ -26,6 +26,7 @@ properties:
+   compatible:
+     items:
+       - enum:
++          - realtek,rtl8197f-gpio
+           - realtek,rtl8380-gpio
+           - realtek,rtl8390-gpio
+           - realtek,rtl9300-gpio
+Index: linux-6.18.52/drivers/gpio/gpio-realtek-otto.c
+===================================================================
+--- linux-6.18.52.orig/drivers/gpio/gpio-realtek-otto.c
++++ linux-6.18.52/drivers/gpio/gpio-realtek-otto.c
+@@ -339,6 +339,10 @@ static const struct of_device_id realtek
+ 		.data = (void *)GPIO_INTERRUPTS_DISABLED,
+ 	},
+ 	{
++		.compatible = "realtek,rtl8197f-gpio",
++		.data = (void *)GPIO_PORTS_REVERSED,
++	},
++	{
+ 		.compatible = "realtek,rtl8380-gpio",
+ 	},
+ 	{

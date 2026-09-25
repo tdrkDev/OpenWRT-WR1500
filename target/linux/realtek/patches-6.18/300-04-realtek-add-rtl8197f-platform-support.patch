@@ -1,0 +1,232 @@
+From: Roman Rikhter <teledurak@gmail.com>
+Subject: [PATCH] realtek: add RTL8197F platform support
+
+The RTL8197F is a little endian single core MIPS 24Kc router SoC that
+shares the interrupt controller, UART and some other blocks with the
+Realtek Otto switch SoCs. Add it to the generic Realtek board:
+
+ - RTL8197F Kconfig symbol, allowing a little endian kernel with the
+   R4K clocksource
+ - identify the SoC from the system revision register instead of the
+   switch core, which must not be touched this early
+ - stop the watchdog left running by the bootloader
+ - unmask and route the CPU timer interrupt, which passes the second
+   interrupt controller bank, to CPU IRQ 7
+ - early printk on UART0
+
+Signed-off-by: Roman Rikhter <teledurak@gmail.com>
+---
+Index: linux-6.18.52/arch/mips/Kconfig
+===================================================================
+--- linux-6.18.52.orig/arch/mips/Kconfig
++++ linux-6.18.52/arch/mips/Kconfig
+@@ -1060,6 +1060,16 @@ config FIT_IMAGE_FDT_EPM5
+ 	  from Mobileye in the FIT kernel image.
+ 	  This requires u-boot on the platform.
+ 
++config RTL8197F
++	bool "Realtek RTL8197F based platforms"
++	depends on MACH_REALTEK_RTL
++	select CSRC_R4K
++	select SYS_SUPPORTS_LITTLE_ENDIAN
++	help
++	  Realtek RTL8197F/RTL8197FH/RTL8197FS router SoCs with a single
++	  MIPS 24Kc core. Unlike the RTL83xx/RTL93xx switch SoCs these run
++	  little endian.
++
+ config RTL838X
+ 	bool "Realtek RTL838X based platforms"
+ 	depends on MACH_REALTEK_RTL
+@@ -1254,6 +1264,7 @@ config SYS_SUPPORTS_RELOCATABLE
+ #
+ choice
+ 	prompt "Endianness selection"
++	default CPU_LITTLE_ENDIAN if RTL8197F
+ 	help
+ 	  Some MIPS machines can be configured for either little or big endian
+ 	  byte order. These modes require different kernels and a different
+Index: linux-6.18.52/arch/mips/generic/board-realtek.c
+===================================================================
+--- linux-6.18.52.orig/arch/mips/generic/board-realtek.c
++++ linux-6.18.52/arch/mips/generic/board-realtek.c
+@@ -10,6 +10,8 @@
+ 
+ #include <asm/fw/fw.h>
+ #include <asm/machine.h>
++#include <asm/irq.h>
++#include <asm/setup.h>
+ 
+ #include <mach-rtl-otto.h>
+ 
+@@ -30,13 +32,22 @@
+ 
+ #define RTL931X_DRAM_CONFIG		0x14304c
+ 
++#define RTL8197F_REVR			0x0000
++#define RTL8197F_BOND_OPTION		0x000c
++#define RTL8197F_GIMR2			0x3020
++#define RTL8197F_IRR5			0x302c
++#define RTL8197F_WDTCNR			0x311c
++#define RTL8197F_UART0_BASE		0x18147000
++
+ #define soc_r32(reg)			__raw_readl(RTL_SOC_BASE + reg)
+ #define soc_w32(val, reg)		__raw_writel(val, RTL_SOC_BASE + reg)
+ 
+ struct realtek_soc_data {
+ 	u32 model_info_reg;
++	u32 (*read_model)(void);
+ 	u32 family;
+ 	int cpu_port;
++	void (*parse_model)(u32 model);
+ 	void (*read_details)(u32 model);
+ 	void (*apply_quirks)(void);
+ 	void (*get_memory)(void);
+@@ -61,6 +72,17 @@ static unsigned int __init realtek_measu
+ 		of_node_put(np);
+ 	}
+ 
++	/*
++	 * IntCtl of the RTL8197F claims the timer interrupt at IP2, which is
++	 * the interrupt controller cascade. The SoC instead routes it through
++	 * the interrupt controller to IP7, see rtl8197f_apply_early_quirks().
++	 * The performance counter interrupt is not wired at all.
++	 */
++	if (soc_info.family == RTL8197F_FAMILY_ID) {
++		cp0_compare_irq = 7;
++		cp0_perfcount_irq = -1;
++	}
++
+ 	return freq / 2;
+ }
+ 
+@@ -172,6 +194,69 @@ static void __init rtl96xx_read_details(
+ 	soc_info.revision = model & 0xf;
+ }
+ 
++static u32 __init rtl8197f_read_model(void)
++{
++	/*
++	 * RTL8197F has no switch style model register. Accessing the switch
++	 * core at 0xbb000000 this early is unsafe, use the system revision
++	 * register instead: 0x8197fxxx for RTL8197F, 0x81970xxx for the VG
++	 * variants.
++	 */
++	return soc_r32(RTL8197F_REVR);
++}
++
++static void __init rtl8197f_apply_early_quirks(void)
++{
++	u32 val;
++
++	/*
++	 * The bootloader may leave the watchdog running. Kick it and write
++	 * the disable pattern as the vendor BSP does.
++	 */
++	soc_w32(soc_r32(RTL8197F_WDTCNR) | BIT(23), RTL8197F_WDTCNR);
++	soc_w32(0xa5000000, RTL8197F_WDTCNR);
++
++	/*
++	 * The CP0 count/compare interrupt of the CPU is not wired directly to
++	 * MIPS IRQ 7 but passes the second bank of the interrupt controller
++	 * as input 47. Unmask it there and route it to CPU IRQ 7.
++	 */
++	val = soc_r32(RTL8197F_IRR5) & ~GENMASK(31, 28);
++	soc_w32(val | (7 << 28), RTL8197F_IRR5);
++	soc_w32(soc_r32(RTL8197F_GIMR2) | BIT(15), RTL8197F_GIMR2);
++
++	setup_8250_early_printk_port(CKSEG1ADDR(RTL8197F_UART0_BASE), 2, 50000);
++}
++
++static void __init rtl8197f_read_details(u32 model)
++{
++	soc_info.cpu = soc_info.id;
++	soc_info.revision = model & 0xf;
++}
++
++static void __init rtl8197f_parse_model(u32 model)
++{
++	const char *variant = "";
++	const char *vg = "";
++
++	switch (soc_r32(RTL8197F_BOND_OPTION) & 0xf) {
++	case 0x0:
++		variant = "B";
++		break;
++	case 0x4 ... 0x6:
++		variant = "H";
++		break;
++	case 0xa ... 0xc:
++		variant = "S";
++		break;
++	}
++
++	if ((model & 0xfffff000) == 0x81970000)
++		vg = "-VG";
++
++	snprintf(soc_info.name, sizeof(soc_info.name), "RTL8197F%s%s", variant, vg);
++}
++
+ static void __init realtek_parse_model(u32 model)
+ {
+ 	int val;
+@@ -288,7 +373,10 @@ static void __init realtek_prom_init(con
+ 	if (!cfg)
+ 		panic("No match_data found!");
+ 
+-	model = sw_r32(cfg->model_info_reg);
++	if (cfg->read_model)
++		model = cfg->read_model();
++	else
++		model = sw_r32(cfg->model_info_reg);
+ 
+ 	soc_info.id = model >> 16 & 0xffff;
+ 	soc_info.family = cfg->family;
+@@ -298,14 +386,21 @@ static void __init realtek_prom_init(con
+ 		cfg->apply_quirks();
+ 
+ 	cfg->read_details(model);
+-	realtek_parse_model(model);
++	if (cfg->parse_model)
++		cfg->parse_model(model);
++	else
++		realtek_parse_model(model);
+ 	realtek_set_system_type();
+-	cfg->get_memory();
++	if (cfg->get_memory)
++		cfg->get_memory();
+ 
+ 	if (cfg->prepare_highmem)
+ 		cfg->prepare_highmem();
+ 
+-	pr_info("%s SoC with %d MB\n", get_system_type(), soc_info.memory_size >> 20);
++	if (soc_info.memory_size)
++		pr_info("%s SoC with %d MB\n", get_system_type(), soc_info.memory_size >> 20);
++	else
++		pr_info("%s SoC\n", get_system_type());
+ 
+ 	/*
+ 	 * fw_arg2 is the pointer to the environment. Some devices (e.g. HP JG924A) hand
+@@ -387,6 +482,15 @@ static __init const void *realtek_fixup_
+ 
+ }
+ 
++static const struct realtek_soc_data rtl8197f_soc __initconst = {
++	.read_model = rtl8197f_read_model,
++	.family = RTL8197F_FAMILY_ID,
++	.cpu_port = -1,
++	.apply_quirks = rtl8197f_apply_early_quirks,
++	.read_details = rtl8197f_read_details,
++	.parse_model = rtl8197f_parse_model,
++};
++
+ static const struct realtek_soc_data rtl838x_soc __initconst = {
+ 	.model_info_reg = RTL838X_MODEL_NAME_INFO,
+ 	.family = RTL8380_FAMILY_ID,
+@@ -431,6 +535,7 @@ static const struct realtek_soc_data rtl
+ };
+ 
+ static const struct of_device_id realtek_of_match[] __initconst = {
++	{ .compatible = "realtek,rtl8197f-soc", .data = &rtl8197f_soc },
+ 	{ .compatible = "realtek,rtl8380-soc", .data = &rtl838x_soc },
+ 	{ .compatible = "realtek,rtl8381-soc", .data = &rtl838x_soc },
+ 	{ .compatible = "realtek,rtl8382-soc", .data = &rtl838x_soc },
