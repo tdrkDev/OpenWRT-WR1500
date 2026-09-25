@@ -5,8 +5,9 @@
  * The RTL8197F contains an rtl865x style switch core. Its port 0 is an RGMII
  * MAC that connects to an external switch. This driver only handles the CPU
  * interface (NIC) of the switch core: frames are sent directly to port 0 and
- * the switch core forwards frames from port 0 to the CPU. The switch core
- * itself is expected to be set up by the boot code, which always does so.
+ * the switch core forwards frames from port 0 to the CPU. The driver resets
+ * the switch core and sets up port 0 as the boot code does; the boot code
+ * turns the switch core off before it starts a kernel from flash.
  *
  * With "realtek,cpu-tag", the external switch is a Realtek RTL83xx that tags
  * frames to and from its CPU port with a 4 byte Realtek CPU tag. Port 0 then
@@ -19,6 +20,7 @@
  */
 
 #include <linux/bitfield.h>
+#include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/etherdevice.h>
 #include <linux/ethtool.h>
@@ -28,11 +30,13 @@
 #include <linux/io.h>
 #include <linux/ip.h>
 #include <linux/ipv6.h>
+#include <linux/mfd/syscon.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/netdevice.h>
 #include <linux/of_net.h>
 #include <linux/platform_device.h>
+#include <linux/regmap.h>
 #include <linux/sizes.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
@@ -40,6 +44,12 @@
 #include <net/dsa.h>
 #include <net/dst_metadata.h>
 #include <net/page_pool/helpers.h>
+
+/* System controller registers */
+#define SYS_CLK_MANAGE			0x010
+#define   SYS_CLK_ACTIVE_LX1_ARB	BIT(13)
+#define   SYS_CLK_ACTIVE_LX1		BIT(12)
+#define   SYS_CLK_ACTIVE_SWCORE		BIT(11)
 
 /* CPU interface registers */
 #define NIC_CPUICR			0x000
@@ -66,7 +76,11 @@
 #define NIC_DMA_CR2			0x044
 #define   NIC_DMA_CR2_RX_MAXLEN		GENMASK(15, 0)
 #define NIC_TXRINGCR			0x078
-#define   NIC_TXRINGCR_RING1_EN		BIT(1)
+#define   NIC_TXRINGCR_BLEN_ADJ		BIT(31)
+#define   NIC_TXRINGCR_RING3_FIFO	GENMASK(19, 18)
+#define   NIC_TXRINGCR_RING2_FIFO	GENMASK(17, 16)
+#define   NIC_TXRINGCR_TXDCP_BP		GENMASK(11, 8)
+#define   NIC_TXRINGCR_ROUND		BIT(4)
 #define   NIC_TXRINGCR_RING0_EN		BIT(0)
 #define NIC_DMA_CR4			0x0a0
 #define   NIC_DMA_CR4_RX_TAIL		BIT(8)
@@ -79,22 +93,42 @@
 #define   NIC_CPUICR1_TX_GATHER		BIT(6)
 #define   NIC_CPUICR1_TSO_ID_INC	BIT(4)
 #define   NIC_CPUICR1_LITTLE_ENDIAN	BIT(1)
+#define   NIC_CPUICR1_TXRX_DIV_LX	BIT(0)
 
 /* Switch core registers */
 #define SW_MIB_IN(port, off)		(0x1100 + 0x80 * (port) + (off))
 #define SW_MIB_OUT(port, off)		(0x1800 + 0x80 * (port) + (off))
 #define SW_CSCR				0x4048
+#define   SW_CSCR_L4_CHK_CAL		BIT(5)
+#define   SW_CSCR_L3_CHK_CAL		BIT(4)
 #define SW_MACCR1			0x4058
 #define   SW_MACCR1_RMD_TAG		GENMASK(7, 6)
 #define   SW_MACCR1_RMD_TAG_NONE	1	/* no VLAN tag in router mode */
 #define   SW_MACCR1_P0_ROUTER_MODE	BIT(0)
+#define SW_PITCR			0x4100
+#define   SW_PITCR_P0_EXT		BIT(0)	/* port 0 is (G/R)MII */
+#define SW_PCRP0			0x4104
+#define   SW_PCR_EXT_PHY_ID		GENMASK(30, 26)
+#define   SW_PCR_FORCE			BIT(25)
+#define   SW_PCR_FORCE_LINK		BIT(23)
+#define   SW_PCR_AN_STATUS		GENMASK(22, 18)
+#define   SW_PCR_FORCE_SPEED		GENMASK(20, 19)
+#define   SW_PCR_FORCE_SPEED_1000	2
+#define   SW_PCR_FORCE_DUPLEX		BIT(18)
+#define   SW_PCR_MII_RXER		BIT(13)
+#define   SW_PCR_MAC_NORMAL		BIT(3)	/* MAC out of reset */
+#define   SW_PCR_PHY_IF_EN		BIT(0)
 #define SW_P0GMIICR			0x414c
 #define   SW_P0GMIICR_TX_CPU_TAG	BIT(26)
 #define   SW_P0GMIICR_CPU_TAG		BIT(25)
-#define   SW_CSCR_L4_CHK_CAL		BIT(5)
-#define   SW_CSCR_L3_CHK_CAL		BIT(4)
+#define   SW_P0GMIICR_CONF_DONE		BIT(6)
+#define   SW_P0GMIICR_TX_DELAY		BIT(4)
+#define   SW_P0GMIICR_RX_DELAY		GENMASK(2, 0)
 #define SW_SIRR				0x4204
+#define   SW_SIRR_FULL_RST		BIT(2)	/* reset tables and queues */
 #define   SW_SIRR_TRXRDY		BIT(0)
+#define SW_MEMCR			0x4234
+#define   SW_MEMCR_INIT			GENMASK(6, 0)
 #define SW_SWTCR0			0x4418
 #define   SW_SWTCR0_STOP_TLU_READY	BIT(19)
 #define   SW_SWTCR0_STOP_TLU		BIT(18)
@@ -103,6 +137,8 @@
 #define   SW_FFCR_UNK_MC_TO_CPU		BIT(0)
 #define SW_L2_LEARN_LIMIT(n)		(0x4488 + 4 * (n))	/* two ports each */
 #define   SW_L2_LEARN_LIMIT_EN		(BIT(16) | BIT(0))	/* limit is 0 */
+#define SW_QNUMCR			0x4754
+#define   SW_QNUMCR_1Q(port)		BIT(3 * (port))	/* one output queue */
 #define SW_VCR0				0x4a00
 #define   SW_VCR0_1Q_VID_IGNORE		BIT(31)
 #define   SW_VCR0_INGRESS_FILTER	GENMASK(8, 0)
@@ -173,7 +209,9 @@
 #define RTL8197F_ETH_FIFO_LOW		0xa0
 #define RTL8197F_ETH_FIFO_HIGH		0xce
 #define RTL8197F_ETH_PORTS		8	/* of the external switch */
-#define RTL8197F_ETH_VID		1	/* switch core VLAN in router mode */
+#define RTL8197F_ETH_VID		1	/* switch core VLAN of all ports */
+#define RTL8197F_ETH_P0_PHY_ID		5	/* as the boot code sets it */
+#define RTL8197F_ETH_P0_RX_DELAY	5	/* as the boot code sets it */
 #define RTL8197F_ETH_DSA_TAG_LEN	8	/* "rtl8_4" tag of transmitted frames */
 
 /* Each RX buffer is a page fragment that becomes the skb head */
@@ -207,6 +245,7 @@ struct rtl8197f_eth {
 	void __iomem *nic;
 	void __iomem *swcore;
 	void __iomem *tables;
+	struct regmap *sysctl;
 	struct napi_struct napi;
 	struct work_struct reset_work;
 	struct rtl8197f_eth_stats stats;
@@ -733,14 +772,63 @@ static int rtl8197f_eth_tbl_write(struct rtl8197f_eth *eth, unsigned int type,
 }
 
 /*
- * In router mode the switch core treats the ports of the external switch as
- * its own ports and would forward between them. Send everything to the CPU
- * instead: a VLAN with only the CPU as member for all ports, no learning of
- * MAC addresses, unknown destinations trapped to the CPU. By default, router
- * mode also adds a VLAN tag to frames sent to port 0, which the external
- * switch passes on; turn that off and keep the VLAN untagged everywhere.
+ * Reset the switch core and set up port 0 for an external switch on RGMII,
+ * as the boot code does. The boot code turns the switch core off before it
+ * starts a kernel from flash, which loses this setup.
  */
-static void rtl8197f_eth_setup_cpu_tag(struct rtl8197f_eth *eth)
+static int rtl8197f_eth_hw_init(struct rtl8197f_eth *eth)
+{
+	u32 qnum = 0;
+	int i, ret;
+
+	ret = regmap_set_bits(eth->sysctl, SYS_CLK_MANAGE,
+			      SYS_CLK_ACTIVE_LX1_ARB | SYS_CLK_ACTIVE_LX1 |
+			      SYS_CLK_ACTIVE_SWCORE);
+	if (ret)
+		return ret;
+
+	sw_rmw(eth, SW_SIRR, 0, SW_SIRR_FULL_RST);
+	msleep(300);
+	regmap_clear_bits(eth->sysctl, SYS_CLK_MANAGE, SYS_CLK_ACTIVE_SWCORE);
+	msleep(300);
+	regmap_set_bits(eth->sysctl, SYS_CLK_MANAGE, SYS_CLK_ACTIVE_SWCORE);
+	msleep(50);
+
+	writel(0, eth->swcore + SW_MEMCR);
+	writel(SW_MEMCR_INIT, eth->swcore + SW_MEMCR);
+
+	/* Port 0: RGMII, forced to 1000 Mbit/s full duplex */
+	sw_rmw(eth, SW_PITCR, 0, SW_PITCR_P0_EXT);
+	sw_rmw(eth, SW_PCRP0, SW_PCR_EXT_PHY_ID | SW_PCR_AN_STATUS,
+	       FIELD_PREP(SW_PCR_EXT_PHY_ID, RTL8197F_ETH_P0_PHY_ID) |
+	       SW_PCR_FORCE | SW_PCR_FORCE_LINK |
+	       FIELD_PREP(SW_PCR_FORCE_SPEED, SW_PCR_FORCE_SPEED_1000) |
+	       SW_PCR_FORCE_DUPLEX | SW_PCR_MII_RXER | SW_PCR_MAC_NORMAL |
+	       SW_PCR_PHY_IF_EN);
+	sw_rmw(eth, SW_P0GMIICR, SW_P0GMIICR_TX_DELAY | SW_P0GMIICR_RX_DELAY,
+	       SW_P0GMIICR_TX_DELAY |
+	       FIELD_PREP(SW_P0GMIICR_RX_DELAY, RTL8197F_ETH_P0_RX_DELAY));
+	sw_rmw(eth, SW_P0GMIICR, 0, SW_P0GMIICR_CONF_DONE);
+
+	/* One output queue per port, unknown destinations to the CPU */
+	for (i = 0; i < 5; i++)
+		qnum |= SW_QNUMCR_1Q(i);
+	writel(qnum, eth->swcore + SW_QNUMCR);
+	writel(SW_FFCR_UNK_UC_TO_CPU | SW_FFCR_UNK_MC_TO_CPU,
+	       eth->swcore + SW_FFCR);
+
+	return 0;
+}
+
+/*
+ * Send everything from port 0 to the CPU: a VLAN with only the CPU as member
+ * for all ports and no learning of MAC addresses. In router mode the switch
+ * core treats the ports of the external switch as its own ports and would
+ * otherwise forward between them. By default, router mode also adds a VLAN
+ * tag to frames sent to port 0, which the external switch passes on; turn
+ * that off and keep the VLAN untagged everywhere.
+ */
+static void rtl8197f_eth_setup_switch(struct rtl8197f_eth *eth)
 {
 	u32 vlan[SW_TBL_VLAN_WORDS] = {
 		FIELD_PREP(SW_VLAN0_EXT_MEMBER, SW_VLAN_EXT_CPU) |
@@ -750,10 +838,13 @@ static void rtl8197f_eth_setup_cpu_tag(struct rtl8197f_eth *eth)
 	u32 l2[SW_TBL_L2_WORDS] = {};
 	int i, ret;
 
-	sw_rmw(eth, SW_P0GMIICR, 0, SW_P0GMIICR_CPU_TAG | SW_P0GMIICR_TX_CPU_TAG);
-	sw_rmw(eth, SW_MACCR1, SW_MACCR1_RMD_TAG,
-	       SW_MACCR1_P0_ROUTER_MODE |
-	       FIELD_PREP(SW_MACCR1_RMD_TAG, SW_MACCR1_RMD_TAG_NONE));
+	if (eth->cpu_tag) {
+		sw_rmw(eth, SW_P0GMIICR, 0,
+		       SW_P0GMIICR_CPU_TAG | SW_P0GMIICR_TX_CPU_TAG);
+		sw_rmw(eth, SW_MACCR1, SW_MACCR1_RMD_TAG,
+		       SW_MACCR1_P0_ROUTER_MODE |
+		       FIELD_PREP(SW_MACCR1_RMD_TAG, SW_MACCR1_RMD_TAG_NONE));
+	}
 
 	ret = rtl8197f_eth_tbl_write(eth, SW_TBL_VLAN, RTL8197F_ETH_VID, vlan,
 				     ARRAY_SIZE(vlan));
@@ -767,8 +858,6 @@ static void rtl8197f_eth_setup_cpu_tag(struct rtl8197f_eth *eth)
 		writel(SW_L2_LEARN_LIMIT_EN, eth->swcore + SW_L2_LEARN_LIMIT(i));
 	for (i = 0; !ret && i < SW_TBL_L2_ENTRIES; i++)
 		ret = rtl8197f_eth_tbl_write(eth, SW_TBL_L2, i, l2, ARRAY_SIZE(l2));
-
-	sw_rmw(eth, SW_FFCR, 0, SW_FFCR_UNK_UC_TO_CPU | SW_FFCR_UNK_MC_TO_CPU);
 
 	if (ret)
 		netdev_err(eth->ndev, "switch core table write timed out\n");
@@ -790,17 +879,24 @@ static void rtl8197f_eth_hw_start(struct rtl8197f_eth *eth)
 
 	/*
 	 * New descriptors in little endian, frames of several TX descriptors,
-	 * IPv4 ID incremented per segment
+	 * IPv4 ID incremented per segment, TX and RX on separate Lexra buses
 	 */
 	nic_rmw(eth, NIC_CPUICR1, NIC_CPUICR1_HDR_TYPE,
 		NIC_CPUICR1_LITTLE_ENDIAN | NIC_CPUICR1_TX_GATHER |
-		NIC_CPUICR1_TSO_ID_INC |
+		NIC_CPUICR1_TSO_ID_INC | NIC_CPUICR1_TXRX_DIV_LX |
 		FIELD_PREP(NIC_CPUICR1_HDR_TYPE, NIC_CPUICR1_HDR_TYPE_NEW));
 
-	/* Deliver all queues to RX ring 0 and use TX ring 0 only */
+	/*
+	 * Deliver all queues to RX ring 0 and use TX ring 0 only, the other
+	 * TX ring settings as the boot code sets them
+	 */
 	for (i = 0; i < 3; i++)
 		nic_w32(eth, NIC_CPUQDM(i), 0);
-	nic_rmw(eth, NIC_TXRINGCR, NIC_TXRINGCR_RING1_EN, NIC_TXRINGCR_RING0_EN);
+	nic_w32(eth, NIC_TXRINGCR, NIC_TXRINGCR_BLEN_ADJ |
+		FIELD_PREP(NIC_TXRINGCR_RING3_FIFO, 2) |
+		FIELD_PREP(NIC_TXRINGCR_RING2_FIFO, 1) |
+		NIC_TXRINGCR_TXDCP_BP | NIC_TXRINGCR_ROUND |
+		NIC_TXRINGCR_RING0_EN);
 
 	nic_w32(eth, NIC_CPURPDCR(0), eth->rx_ring_dma);
 	nic_w32(eth, NIC_CPUTPDCR0, eth->tx_ring_dma);
@@ -833,8 +929,7 @@ static void rtl8197f_eth_hw_start(struct rtl8197f_eth *eth)
 	/* Checksum calculation of the switch core, as the vendor sets it up */
 	sw_rmw(eth, SW_CSCR, 0, SW_CSCR_L4_CHK_CAL | SW_CSCR_L3_CHK_CAL);
 
-	if (eth->cpu_tag)
-		rtl8197f_eth_setup_cpu_tag(eth);
+	rtl8197f_eth_setup_switch(eth);
 
 	sw_rmw(eth, SW_SIRR, 0, SW_SIRR_TRXRDY);
 
@@ -1175,6 +1270,11 @@ static int rtl8197f_eth_probe(struct platform_device *pdev)
 	if (IS_ERR(eth->tables))
 		return PTR_ERR(eth->tables);
 
+	eth->sysctl = syscon_regmap_lookup_by_phandle(dev->of_node, "realtek,sysctl");
+	if (IS_ERR(eth->sysctl))
+		return dev_err_probe(dev, PTR_ERR(eth->sysctl),
+				     "no system controller\n");
+
 	irq = platform_get_irq(pdev, 0);
 	if (irq < 0)
 		return irq;
@@ -1182,6 +1282,18 @@ static int rtl8197f_eth_probe(struct platform_device *pdev)
 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
 	if (ret)
 		return ret;
+
+	ret = of_get_ethdev_address(dev->of_node, ndev);
+	if (ret == -EPROBE_DEFER)
+		return ret;
+	if (ret) {
+		eth_hw_addr_random(ndev);
+		dev_warn(dev, "using random MAC address %pM\n", ndev->dev_addr);
+	}
+
+	ret = rtl8197f_eth_hw_init(eth);
+	if (ret)
+		return dev_err_probe(dev, ret, "cannot reset the switch core\n");
 
 	/* The descriptor layout below assumes 6 word descriptors */
 	if (FIELD_GET(NIC_CPUICR1_RXDSC_SIZE, nic_r32(eth, NIC_CPUICR1)) != RTL8197F_ETH_DESC_WORDS ||
@@ -1196,14 +1308,6 @@ static int rtl8197f_eth_probe(struct platform_device *pdev)
 		ret = rtl8197f_eth_alloc_dsa_meta(eth);
 		if (ret)
 			return ret;
-	}
-
-	ret = of_get_ethdev_address(dev->of_node, ndev);
-	if (ret == -EPROBE_DEFER)
-		return ret;
-	if (ret) {
-		eth_hw_addr_random(ndev);
-		dev_warn(dev, "using random MAC address %pM\n", ndev->dev_addr);
 	}
 
 	ndev->netdev_ops = &rtl8197f_eth_netdev_ops;

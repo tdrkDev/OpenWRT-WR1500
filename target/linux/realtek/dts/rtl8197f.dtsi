@@ -44,6 +44,12 @@
 		#size-cells = <1>;
 		ranges = <0x0 0x18000000 0x4000000>;
 
+		/* System controller: chip ID, clock gates, pad and strap settings */
+		sysctl: syscon@0 {
+			compatible = "realtek,rtl8197f-sysctl", "syscon";
+			reg = <0x0 0x100>;
+		};
+
 		/*
 		 * The second interrupt cell selects the parent: index 0-4 route
 		 * to CPU IRQ 2-6.
@@ -114,6 +120,7 @@
 			reg = <0x10000 0x100>, <0x3800000 0x10000>,
 			      <0x3000000 0x100000>;
 			reg-names = "nic", "swcore", "tables";
+			realtek,sysctl = <&sysctl>;
 			interrupt-parent = <&intc>;
 			interrupts = <15 2>;
 
