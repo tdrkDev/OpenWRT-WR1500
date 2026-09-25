@@ -18,3 +18,14 @@ define Device/rtl8197f-rt-loader
 	rt-loader-rtl8197f
   KERNEL_INITRAMFS := $$(KERNEL)
 endef
+
+define Device/cudy_wr1500
+  $(Device/rtl8197f-rt-loader)
+  SOC := rtl8197fh
+  DEVICE_VENDOR := Cudy
+  DEVICE_MODEL := WR1500
+  SUPPORTED_DEVICES += R76
+  DEVICE_PACKAGES := kmod-switch-rtl8367b swconfig -uboot-envtools
+  IMAGES :=
+endef
+TARGET_DEVICES += cudy_wr1500
