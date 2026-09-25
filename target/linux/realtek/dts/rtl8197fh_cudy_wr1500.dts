@@ -203,9 +203,9 @@
 			};
 
 			partition@40000 {
+				compatible = "denx,uimage";
 				label = "firmware";
 				reg = <0x40000 0xfa0000>;
-				read-only;
 			};
 
 			/* JFFS2 used by the stock firmware, holds "default" */
