@@ -941,13 +941,7 @@ static void rtl8366_debugfs_init(struct rtl8366_smi *smi)
 	}
 	root = smi->debugfs_root;
 
-	node = debugfs_create_x16("reg", S_IRUGO | S_IWUSR, root,
-				  &smi->dbg_reg);
-	if (!node) {
-		dev_err(smi->parent, "Creating debugfs file '%s' failed\n",
-			"reg");
-		return;
-	}
+	debugfs_create_x16("reg", S_IRUGO | S_IWUSR, root, &smi->dbg_reg);
 
 	node = debugfs_create_file("val", S_IRUGO | S_IWUSR, root, smi,
 				   &fops_rtl8366_regs);
@@ -965,13 +959,8 @@ static void rtl8366_debugfs_init(struct rtl8366_smi *smi)
 		return;
 	}
 
-	node = debugfs_create_u8("vlan_4k_page", S_IRUGO | S_IWUSR, root,
-				  &smi->dbg_vlan_4k_page);
-	if (!node) {
-		dev_err(smi->parent, "Creating debugfs file '%s' failed\n",
-			"vlan_4k_page");
-		return;
-	}
+	debugfs_create_u8("vlan_4k_page", S_IRUGO | S_IWUSR, root,
+			  &smi->dbg_vlan_4k_page);
 
 	node = debugfs_create_file("vlan_4k", S_IRUSR, root, smi,
 				   &fops_rtl8366_vlan_4k);
