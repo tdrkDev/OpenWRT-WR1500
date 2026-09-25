@@ -7,6 +7,15 @@
  * interface (NIC) of the switch core: frames are sent directly to port 0 and
  * the switch core forwards frames from port 0 to the CPU. The switch core
  * itself is expected to be set up by the boot code, which always does so.
+ *
+ * With "realtek,cpu-tag", the external switch is a Realtek RTL83xx that tags
+ * frames to and from its CPU port with a 4 byte Realtek CPU tag. Port 0 then
+ * runs in "router mode": the switch core strips the tag and reports the port
+ * of the external switch in the RX descriptor, and inserts a tag for the
+ * destination ports given in the TX descriptor. The driver acts as the DSA
+ * conduit of the external switch: received frames carry the port as
+ * metadata, and the port mask of the "rtl8_4" tag of transmitted frames is
+ * moved into the descriptor.
  */
 
 #include <linux/bitfield.h>
@@ -14,6 +23,7 @@
 #include <linux/etherdevice.h>
 #include <linux/ethtool.h>
 #include <linux/if_vlan.h>
+#include <linux/iopoll.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/ip.h>
@@ -26,6 +36,9 @@
 #include <linux/sizes.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
+#include <linux/unaligned.h>
+#include <net/dsa.h>
+#include <net/dst_metadata.h>
 #include <net/page_pool/helpers.h>
 
 /* CPU interface registers */
@@ -71,15 +84,49 @@
 #define SW_MIB_IN(port, off)		(0x1100 + 0x80 * (port) + (off))
 #define SW_MIB_OUT(port, off)		(0x1800 + 0x80 * (port) + (off))
 #define SW_CSCR				0x4048
+#define SW_MACCR1			0x4058
+#define   SW_MACCR1_RMD_TAG		GENMASK(7, 6)
+#define   SW_MACCR1_RMD_TAG_NONE	1	/* no VLAN tag in router mode */
+#define   SW_MACCR1_P0_ROUTER_MODE	BIT(0)
+#define SW_P0GMIICR			0x414c
+#define   SW_P0GMIICR_TX_CPU_TAG	BIT(26)
+#define   SW_P0GMIICR_CPU_TAG		BIT(25)
 #define   SW_CSCR_L4_CHK_CAL		BIT(5)
 #define   SW_CSCR_L3_CHK_CAL		BIT(4)
 #define SW_SIRR				0x4204
 #define   SW_SIRR_TRXRDY		BIT(0)
+#define SW_SWTCR0			0x4418
+#define   SW_SWTCR0_STOP_TLU_READY	BIT(19)
+#define   SW_SWTCR0_STOP_TLU		BIT(18)
+#define SW_FFCR				0x4428
+#define   SW_FFCR_UNK_UC_TO_CPU		BIT(1)
+#define   SW_FFCR_UNK_MC_TO_CPU		BIT(0)
+#define SW_L2_LEARN_LIMIT(n)		(0x4488 + 4 * (n))	/* two ports each */
+#define   SW_L2_LEARN_LIMIT_EN		(BIT(16) | BIT(0))	/* limit is 0 */
 #define SW_VCR0				0x4a00
 #define   SW_VCR0_1Q_VID_IGNORE		BIT(31)
+#define   SW_VCR0_INGRESS_FILTER	GENMASK(8, 0)
+#define SW_PVCR(n)			(0x4a08 + 4 * (n))	/* two ports each */
+#define   SW_PVCR_PVID_EVEN		GENMASK(11, 0)
+#define   SW_PVCR_PVID_ODD		GENMASK(27, 16)
+#define SW_SWTACR			0x4d00
+#define   SW_SWTACR_CMD_FORCE		BIT(3)
+#define   SW_SWTACR_START		BIT(0)
+#define SW_SWTAA			0x4d08
+#define SW_TCR(n)			(0x4d20 + 4 * (n))
 
 /* Switch core tables */
 #define SW_TBL_ACL			0x0c0000
+#define SW_TBL_ADDR(type, idx)		(0xbb000000 + ((type) << 16) + (idx) * 32)
+#define SW_TBL_L2			0
+#define   SW_TBL_L2_ENTRIES		1024
+#define   SW_TBL_L2_WORDS		2
+#define SW_TBL_VLAN			6
+#define   SW_TBL_VLAN_WORDS		3
+#define   SW_VLAN0_EXT_UNTAG		GENMASK(17, 15)
+#define   SW_VLAN0_UNTAG		GENMASK(14, 9)
+#define   SW_VLAN0_EXT_MEMBER		GENMASK(8, 6)
+#define   SW_VLAN_EXT_CPU		BIT(2)	/* extension port 2 is the CPU */
 
 /* Descriptor word 0, common to RX and TX */
 #define DESC_OWN			BIT(0)	/* owned by the switch core */
@@ -108,6 +155,7 @@
 #define RXD0_BUFSIZE			GENMASK(31, 16)
 #define RXD2_LEN			GENMASK(13, 0)	/* frame length with FCS */
 #define RXD3_TYPE			GENMASK(31, 29)
+#define RXD4_SPA			GENMASK(15, 13)
 #define RXD4_FRAG			BIT(11)
 #define RXD4_IPV6			BIT(9)
 #define RXD4_IPV4			BIT(8)
@@ -124,6 +172,9 @@
 #define RTL8197F_ETH_TX_PORTS		BIT(0)	/* port 0: RGMII */
 #define RTL8197F_ETH_FIFO_LOW		0xa0
 #define RTL8197F_ETH_FIFO_HIGH		0xce
+#define RTL8197F_ETH_PORTS		8	/* of the external switch */
+#define RTL8197F_ETH_VID		1	/* switch core VLAN in router mode */
+#define RTL8197F_ETH_DSA_TAG_LEN	8	/* "rtl8_4" tag of transmitted frames */
 
 /* Each RX buffer is a page fragment that becomes the skb head */
 #define RTL8197F_ETH_RX_FRAG		2048
@@ -159,6 +210,8 @@ struct rtl8197f_eth {
 	struct napi_struct napi;
 	struct work_struct reset_work;
 	struct rtl8197f_eth_stats stats;
+	bool cpu_tag;
+	struct metadata_dst *dsa_meta[RTL8197F_ETH_PORTS];
 
 	struct page_pool *page_pool;
 	struct rtl8197f_eth_desc *rx_ring;
@@ -303,6 +356,11 @@ static int rtl8197f_eth_rx(struct rtl8197f_eth *eth, int budget)
 		skb_reserve(skb, RTL8197F_ETH_RX_HEADROOM);
 		skb_put(skb, len - ETH_FCS_LEN);
 		skb->protocol = eth_type_trans(skb, ndev);
+		if (eth->cpu_tag && netdev_uses_dsa(ndev)) {
+			unsigned int port = FIELD_GET(RXD4_SPA, READ_ONCE(desc->w[4]));
+
+			skb_dst_set_noref(skb, &eth->dsa_meta[port]->dst);
+		}
 
 		if ((ndev->features & NETIF_F_RXCSUM) &&
 		    rtl8197f_eth_rx_csum_ok(desc)) {
@@ -481,12 +539,37 @@ sw:
 	return skb_checksum_help(skb);
 }
 
+/*
+ * Remove the "rtl8_4" tag the DSA user port put behind the source MAC
+ * address and return its forwarding port mask. The switch core inserts the
+ * CPU tag of the external switch itself.
+ */
+static int rtl8197f_eth_dsa_untag(struct sk_buff *skb, u32 *ports)
+{
+	u8 *tag = skb->data + 2 * ETH_ALEN;
+
+	if (skb_headlen(skb) < 2 * ETH_ALEN + RTL8197F_ETH_DSA_TAG_LEN ||
+	    get_unaligned_be16(tag) != ETH_P_REALTEK || tag[2] != 0x04)
+		return -EINVAL;
+
+	*ports = get_unaligned_be16(tag + 6) & FIELD_MAX(TXD4_DP);
+	memmove(skb->data + RTL8197F_ETH_DSA_TAG_LEN, skb->data, 2 * ETH_ALEN);
+	__skb_pull(skb, RTL8197F_ETH_DSA_TAG_LEN);
+
+	return *ports ? 0 : -EINVAL;
+}
+
 static netdev_tx_t rtl8197f_eth_xmit(struct sk_buff *skb, struct net_device *ndev)
 {
 	struct rtl8197f_eth *eth = netdev_priv(ndev);
 	unsigned int nr_frags, first, idx, frame_len, i;
 	u32 w0 = 0, w3 = 0, w4, w5 = 0, first_w0 = 0;
+	u32 ports = RTL8197F_ETH_TX_PORTS;
 	bool kick;
+
+	if (eth->cpu_tag &&
+	    (!netdev_uses_dsa(ndev) || rtl8197f_eth_dsa_untag(skb, &ports)))
+		goto drop;
 
 	if (skb_put_padto(skb, ETH_ZLEN)) {
 		ndev->stats.tx_dropped++;
@@ -499,7 +582,7 @@ static netdev_tx_t rtl8197f_eth_xmit(struct sk_buff *skb, struct net_device *nde
 		return NETDEV_TX_BUSY;
 	}
 
-	w4 = FIELD_PREP(TXD4_DP, RTL8197F_ETH_TX_PORTS);
+	w4 = FIELD_PREP(TXD4_DP, ports);
 	if (skb->ip_summed == CHECKSUM_PARTIAL &&
 	    rtl8197f_eth_tx_offload(eth, skb, &w0, &w3, &w4, &w5))
 		goto drop;
@@ -622,6 +705,75 @@ static netdev_features_t rtl8197f_eth_features_check(struct sk_buff *skb,
 	return features;
 }
 
+static int rtl8197f_eth_tbl_write(struct rtl8197f_eth *eth, unsigned int type,
+				  unsigned int idx, const u32 *data,
+				  unsigned int words)
+{
+	u32 val;
+	int ret, i;
+
+	/* Stop the table lookup unit while the entry changes */
+	sw_rmw(eth, SW_SWTCR0, 0, SW_SWTCR0_STOP_TLU);
+	ret = readl_poll_timeout_atomic(eth->swcore + SW_SWTCR0, val,
+					val & SW_SWTCR0_STOP_TLU_READY, 1, 1000);
+	if (!ret)
+		ret = readl_poll_timeout_atomic(eth->swcore + SW_SWTACR, val,
+						!(val & SW_SWTACR_START), 1, 1000);
+	if (!ret) {
+		for (i = 0; i < words; i++)
+			writel(data[i], eth->swcore + SW_TCR(i));
+		writel(SW_TBL_ADDR(type, idx), eth->swcore + SW_SWTAA);
+		writel(SW_SWTACR_START | SW_SWTACR_CMD_FORCE, eth->swcore + SW_SWTACR);
+		ret = readl_poll_timeout_atomic(eth->swcore + SW_SWTACR, val,
+						!(val & SW_SWTACR_START), 1, 1000);
+	}
+	sw_rmw(eth, SW_SWTCR0, SW_SWTCR0_STOP_TLU, 0);
+
+	return ret;
+}
+
+/*
+ * In router mode the switch core treats the ports of the external switch as
+ * its own ports and would forward between them. Send everything to the CPU
+ * instead: a VLAN with only the CPU as member for all ports, no learning of
+ * MAC addresses, unknown destinations trapped to the CPU. By default, router
+ * mode also adds a VLAN tag to frames sent to port 0, which the external
+ * switch passes on; turn that off and keep the VLAN untagged everywhere.
+ */
+static void rtl8197f_eth_setup_cpu_tag(struct rtl8197f_eth *eth)
+{
+	u32 vlan[SW_TBL_VLAN_WORDS] = {
+		FIELD_PREP(SW_VLAN0_EXT_MEMBER, SW_VLAN_EXT_CPU) |
+		FIELD_PREP(SW_VLAN0_UNTAG, FIELD_MAX(SW_VLAN0_UNTAG)) |
+		FIELD_PREP(SW_VLAN0_EXT_UNTAG, FIELD_MAX(SW_VLAN0_EXT_UNTAG)),
+	};
+	u32 l2[SW_TBL_L2_WORDS] = {};
+	int i, ret;
+
+	sw_rmw(eth, SW_P0GMIICR, 0, SW_P0GMIICR_CPU_TAG | SW_P0GMIICR_TX_CPU_TAG);
+	sw_rmw(eth, SW_MACCR1, SW_MACCR1_RMD_TAG,
+	       SW_MACCR1_P0_ROUTER_MODE |
+	       FIELD_PREP(SW_MACCR1_RMD_TAG, SW_MACCR1_RMD_TAG_NONE));
+
+	ret = rtl8197f_eth_tbl_write(eth, SW_TBL_VLAN, RTL8197F_ETH_VID, vlan,
+				     ARRAY_SIZE(vlan));
+	for (i = 0; i < 3; i++)
+		writel(FIELD_PREP(SW_PVCR_PVID_EVEN, RTL8197F_ETH_VID) |
+		       FIELD_PREP(SW_PVCR_PVID_ODD, RTL8197F_ETH_VID),
+		       eth->swcore + SW_PVCR(i));
+	sw_rmw(eth, SW_VCR0, SW_VCR0_INGRESS_FILTER, 0);
+
+	for (i = 0; i < 5; i++)
+		writel(SW_L2_LEARN_LIMIT_EN, eth->swcore + SW_L2_LEARN_LIMIT(i));
+	for (i = 0; !ret && i < SW_TBL_L2_ENTRIES; i++)
+		ret = rtl8197f_eth_tbl_write(eth, SW_TBL_L2, i, l2, ARRAY_SIZE(l2));
+
+	sw_rmw(eth, SW_FFCR, 0, SW_FFCR_UNK_UC_TO_CPU | SW_FFCR_UNK_MC_TO_CPU);
+
+	if (ret)
+		netdev_err(eth->ndev, "switch core table write timed out\n");
+}
+
 static void rtl8197f_eth_hw_stop(struct rtl8197f_eth *eth)
 {
 	nic_w32(eth, NIC_CPUIIMR, 0);
@@ -680,6 +832,9 @@ static void rtl8197f_eth_hw_start(struct rtl8197f_eth *eth)
 
 	/* Checksum calculation of the switch core, as the vendor sets it up */
 	sw_rmw(eth, SW_CSCR, 0, SW_CSCR_L4_CHK_CAL | SW_CSCR_L3_CHK_CAL);
+
+	if (eth->cpu_tag)
+		rtl8197f_eth_setup_cpu_tag(eth);
 
 	sw_rmw(eth, SW_SIRR, 0, SW_SIRR_TRXRDY);
 
@@ -916,7 +1071,7 @@ static const unsigned int rtl8197f_eth_nic_regs[] = {
 };
 
 static const unsigned int rtl8197f_eth_sw_regs[] = {
-	SW_CSCR, SW_SIRR, SW_VCR0,
+	SW_CSCR, SW_SIRR, SW_VCR0, SW_MACCR1, SW_P0GMIICR,
 };
 
 static int rtl8197f_eth_get_regs_len(struct net_device *ndev)
@@ -959,6 +1114,37 @@ static const struct ethtool_ops rtl8197f_eth_ethtool_ops = {
 	.get_regs = rtl8197f_eth_get_regs,
 	.get_ringparam = rtl8197f_eth_get_ringparam,
 };
+
+static void rtl8197f_eth_free_dsa_meta(void *data)
+{
+	struct rtl8197f_eth *eth = data;
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(eth->dsa_meta); i++)
+		if (eth->dsa_meta[i])
+			metadata_dst_free(eth->dsa_meta[i]);
+}
+
+static int rtl8197f_eth_alloc_dsa_meta(struct rtl8197f_eth *eth)
+{
+	int i, ret;
+
+	ret = devm_add_action_or_reset(eth->dev, rtl8197f_eth_free_dsa_meta, eth);
+	if (ret)
+		return ret;
+
+	for (i = 0; i < ARRAY_SIZE(eth->dsa_meta); i++) {
+		eth->dsa_meta[i] = metadata_dst_alloc(0, METADATA_HW_PORT_MUX,
+						      GFP_KERNEL);
+		if (!eth->dsa_meta[i])
+			return -ENOMEM;
+
+		eth->dsa_meta[i]->u.port_info.port_id = i;
+		eth->dsa_meta[i]->u.port_info.lower_dev = eth->ndev;
+	}
+
+	return 0;
+}
 
 static int rtl8197f_eth_probe(struct platform_device *pdev)
 {
@@ -1005,6 +1191,13 @@ static int rtl8197f_eth_probe(struct platform_device *pdev)
 
 	rtl8197f_eth_hw_stop(eth);
 
+	eth->cpu_tag = of_property_read_bool(dev->of_node, "realtek,cpu-tag");
+	if (eth->cpu_tag) {
+		ret = rtl8197f_eth_alloc_dsa_meta(eth);
+		if (ret)
+			return ret;
+	}
+
 	ret = of_get_ethdev_address(dev->of_node, ndev);
 	if (ret == -EPROBE_DEFER)
 		return ret;
@@ -1018,6 +1211,9 @@ static int rtl8197f_eth_probe(struct platform_device *pdev)
 	ndev->irq = irq;
 	ndev->min_mtu = ETH_MIN_MTU;
 	ndev->max_mtu = ETH_DATA_LEN;
+	/* DSA user ports add their tag, which is removed before transmission */
+	if (eth->cpu_tag)
+		ndev->max_mtu += RTL8197F_ETH_DSA_TAG_LEN;
 	ndev->hw_features = NETIF_F_SG | NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM |
 			    NETIF_F_TSO | NETIF_F_TSO6 | NETIF_F_RXCSUM;
 	ndev->features = ndev->hw_features;
