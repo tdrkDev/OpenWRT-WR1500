@@ -1,0 +1,21 @@
+. /lib/functions.sh
+. /lib/functions/uci-defaults.sh
+. /lib/functions/system.sh
+
+rtl8197f_setup_interfaces()
+{
+	local board="$1"
+
+	case $board in
+	*)
+		ucidef_set_interface_lan "eth0"
+		;;
+	esac
+}
+
+board_config_update
+board=$(board_name)
+rtl8197f_setup_interfaces $board
+board_config_flush
+
+exit 0

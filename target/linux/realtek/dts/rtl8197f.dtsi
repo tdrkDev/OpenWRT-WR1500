@@ -1,0 +1,170 @@
+// SPDX-License-Identifier: GPL-2.0-or-later OR MIT
+
+/dts-v1/;
+
+/ {
+	#address-cells = <1>;
+	#size-cells = <1>;
+
+	compatible = "realtek,rtl8197f-soc";
+
+	aliases {
+		serial0 = &uart0;
+		serial1 = &uart1;
+		serial2 = &uart2;
+	};
+
+	chosen {
+		stdout-path = "serial0:38400n8";
+	};
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		/* The CP0 counter runs at half the CPU clock */
+		frequency = <1000000000>;
+
+		cpu@0 {
+			compatible = "mips,mips24Kc";
+			reg = <0>;
+		};
+	};
+
+	cpuintc: cpuintc {
+		compatible = "mti,cpu-interrupt-controller";
+		#address-cells = <0>;
+		#interrupt-cells = <1>;
+		interrupt-controller;
+	};
+
+	soc: soc@18000000 {
+		compatible = "simple-bus";
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges = <0x0 0x18000000 0x4000000>;
+
+		/*
+		 * The second interrupt cell selects the parent: index 0-4 route
+		 * to CPU IRQ 2-6.
+		 */
+		intc: interrupt-controller@3000 {
+			compatible = "realtek,rtl8197f-intc", "realtek,rtl-intc";
+			reg = <0x3000 0x18>;
+			interrupt-controller;
+			#interrupt-cells = <2>;
+
+			interrupt-parent = <&cpuintc>;
+			interrupts = <2>, <3>, <4>, <5>, <6>;
+		};
+
+		pinmux: pinmux@800 {
+			compatible = "pinctrl-single";
+			reg = <0x800 0x4c>;
+
+			pinctrl-single,bit-per-mux;
+			pinctrl-single,register-width = <32>;
+			pinctrl-single,function-mask = <0xf>;
+			#pinctrl-cells = <2>;
+		};
+
+		timer@3100 {
+			compatible = "realtek,rtl8197f-timer", "syscon", "simple-mfd";
+			reg = <0x3100 0x20>;
+
+			/* Arm the watchdog with the shortest timeout, as the vendor BSP does */
+			reboot {
+				compatible = "syscon-reboot";
+				offset = <0x1c>;
+				value = <0x0>;
+			};
+		};
+
+		/* Ports A-D */
+		gpio0: gpio@3500 {
+			compatible = "realtek,rtl8197f-gpio", "realtek,otto-gpio";
+			reg = <0x3500 0x1c>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			ngpios = <32>;
+
+			interrupt-controller;
+			#interrupt-cells = <2>;
+			interrupt-parent = <&intc>;
+			interrupts = <16 0>;
+		};
+
+		/* Ports E-H */
+		gpio1: gpio@351c {
+			compatible = "realtek,rtl8197f-gpio", "realtek,otto-gpio";
+			reg = <0x351c 0x1c>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			ngpios = <32>;
+
+			interrupt-controller;
+			#interrupt-cells = <2>;
+			interrupt-parent = <&intc>;
+			interrupts = <17 0>;
+		};
+
+		/* CPU port of the switch core, port 0 is the RGMII MAC */
+		ethernet0: ethernet@10000 {
+			compatible = "realtek,rtl8197f-eth";
+			reg = <0x10000 0x100>, <0x3800000 0x10000>,
+			      <0x3000000 0x100000>;
+			reg-names = "nic", "swcore", "tables";
+			interrupt-parent = <&intc>;
+			interrupts = <15 2>;
+
+			status = "disabled";
+		};
+
+		spi0: spi@143000 {
+			compatible = "realtek,rtl8197f-spic";
+			reg = <0x143000 0x200>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			status = "disabled";
+		};
+
+		uart0: serial@147000 {
+			compatible = "ns16550a";
+			reg = <0x147000 0x100>;
+			interrupt-parent = <&intc>;
+			interrupts = <9 0>;
+			clock-frequency = <100000000>;
+			reg-io-width = <4>;
+			reg-shift = <2>;
+			fifo-size = <16>;
+			no-loopback-test;
+
+			status = "disabled";
+		};
+
+		uart1: serial@147400 {
+			compatible = "ns16550a";
+			reg = <0x147400 0x100>;
+			clock-frequency = <100000000>;
+			reg-io-width = <4>;
+			reg-shift = <2>;
+			fifo-size = <16>;
+			no-loopback-test;
+
+			status = "disabled";
+		};
+
+		uart2: serial@147800 {
+			compatible = "ns16550a";
+			reg = <0x147800 0x100>;
+			clock-frequency = <100000000>;
+			reg-io-width = <4>;
+			reg-shift = <2>;
+			fifo-size = <16>;
+			no-loopback-test;
+
+			status = "disabled";
+		};
+	};
+};
