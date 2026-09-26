@@ -154,7 +154,8 @@
 
 /* Switch core tables */
 #define SW_TBL_ACL			0x0c0000
-#define SW_TBL_ADDR(type, idx)		(0xbb000000 + ((type) << 16) + (idx) * 32)
+#define SW_TBL_OFFSET(type, idx)	(((type) << 16) + (idx) * 32)
+#define SW_TBL_ADDR(type, idx)		(0xbb000000 + SW_TBL_OFFSET(type, idx))
 #define SW_TBL_L2			0
 #define   SW_TBL_L2_ENTRIES		1024
 #define   SW_TBL_L2_WORDS		2
@@ -795,8 +796,14 @@ static int rtl8197f_eth_hw_init(struct rtl8197f_eth *eth)
 	regmap_set_bits(eth->sysctl, SYS_CLK_MANAGE, SYS_CLK_ACTIVE_SWCORE);
 	msleep(50);
 
+	/*
+	 * Clear all tables. The clear runs on after the write, and its done
+	 * bits stay set from the last clear, so wait for it instead: tables
+	 * written in the meantime are wiped. It takes a few milliseconds.
+	 */
 	writel(0, eth->swcore + SW_MEMCR);
 	writel(SW_MEMCR_INIT, eth->swcore + SW_MEMCR);
+	msleep(50);
 
 	/* Port 0: RGMII, forced to 1000 Mbit/s full duplex */
 	sw_rmw(eth, SW_PITCR, 0, SW_PITCR_P0_EXT);
@@ -828,8 +835,11 @@ static int rtl8197f_eth_hw_init(struct rtl8197f_eth *eth)
  * otherwise forward between them. By default, router mode also adds a VLAN
  * tag to frames sent to port 0, which the external switch passes on; turn
  * that off and keep the VLAN untagged everywhere.
+ *
+ * This runs once at probe, so that resets of the CPU interface keep the
+ * tables of the switch core.
  */
-static void rtl8197f_eth_setup_switch(struct rtl8197f_eth *eth)
+static int rtl8197f_eth_setup_switch(struct rtl8197f_eth *eth)
 {
 	u32 vlan[SW_TBL_VLAN_WORDS] = {
 		FIELD_PREP(SW_VLAN0_EXT_MEMBER, SW_VLAN_EXT_CPU) |
@@ -838,6 +848,16 @@ static void rtl8197f_eth_setup_switch(struct rtl8197f_eth *eth)
 	};
 	u32 l2[SW_TBL_L2_WORDS] = {};
 	int i, ret;
+
+	/*
+	 * Frames from the external switch may carry 802.1Q tags that are
+	 * unknown to the switch core VLAN table. Classify all frames by the
+	 * port VLAN instead, so they pass unmodified.
+	 */
+	sw_rmw(eth, SW_VCR0, 0, SW_VCR0_1Q_VID_IGNORE);
+
+	/* Checksum calculation of the switch core, as the vendor sets it up */
+	sw_rmw(eth, SW_CSCR, 0, SW_CSCR_L4_CHK_CAL | SW_CSCR_L3_CHK_CAL);
 
 	if (eth->cpu_tag) {
 		sw_rmw(eth, SW_P0GMIICR, 0,
@@ -860,8 +880,12 @@ static void rtl8197f_eth_setup_switch(struct rtl8197f_eth *eth)
 	for (i = 0; !ret && i < SW_TBL_L2_ENTRIES; i++)
 		ret = rtl8197f_eth_tbl_write(eth, SW_TBL_L2, i, l2, ARRAY_SIZE(l2));
 
-	if (ret)
-		netdev_err(eth->ndev, "switch core table write timed out\n");
+	/* Without the VLAN, nothing reaches the CPU */
+	if (!ret && readl(eth->tables + SW_TBL_OFFSET(SW_TBL_VLAN,
+						      RTL8197F_ETH_VID)) != vlan[0])
+		ret = -EIO;
+
+	return ret;
 }
 
 static void rtl8197f_eth_hw_stop(struct rtl8197f_eth *eth)
@@ -919,18 +943,6 @@ static void rtl8197f_eth_hw_start(struct rtl8197f_eth *eth)
 
 	/* The vendor driver reads ACL entry 0 to make reception work */
 	writel(readl(eth->tables + SW_TBL_ACL), eth->tables + SW_TBL_ACL);
-
-	/*
-	 * Frames from the external switch may carry 802.1Q tags that are
-	 * unknown to the switch core VLAN table. Classify all frames by the
-	 * port VLAN instead, so they pass unmodified.
-	 */
-	sw_rmw(eth, SW_VCR0, 0, SW_VCR0_1Q_VID_IGNORE);
-
-	/* Checksum calculation of the switch core, as the vendor sets it up */
-	sw_rmw(eth, SW_CSCR, 0, SW_CSCR_L4_CHK_CAL | SW_CSCR_L3_CHK_CAL);
-
-	rtl8197f_eth_setup_switch(eth);
 
 	sw_rmw(eth, SW_SIRR, 0, SW_SIRR_TRXRDY);
 
@@ -1554,6 +1566,10 @@ static int rtl8197f_eth_probe(struct platform_device *pdev)
 	rtl8197f_eth_hw_stop(eth);
 
 	eth->cpu_tag = of_property_read_bool(dev->of_node, "realtek,cpu-tag");
+	ret = rtl8197f_eth_setup_switch(eth);
+	if (ret)
+		return dev_err_probe(dev, ret, "cannot set up the switch core tables\n");
+
 	if (eth->cpu_tag) {
 		ret = rtl8197f_eth_alloc_dsa_meta(eth);
 		if (ret)
