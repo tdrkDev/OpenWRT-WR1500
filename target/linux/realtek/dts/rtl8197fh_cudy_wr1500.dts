@@ -141,16 +141,26 @@
 };
 
 &ethernet0 {
-	nvmem-cells = <&macaddr_cfg_7>;
+	nvmem-cells = <&macaddr_cfg_7 0>;
 	nvmem-cell-names = "mac-address";
 	realtek,cpu-tag;
 
 	status = "okay";
 };
 
-/* RTL8832BR 5 GHz radio */
 &pcie {
 	status = "okay";
+
+	/* RTL8832BR 5 GHz radio, calibrated from the cfg partition */
+	wifi@1,0 {
+		compatible = "pci10ec,b832";
+		reg = <0x0800 0 0 0 0>;
+		nvmem-cells = <&macaddr_cfg_7 2>, <&cal_cfg_14>, <&cal_cfg_16>,
+			      <&cal_cfg_f4>, <&cal_cfg_1b8>;
+		nvmem-cell-names = "mac-address", "efuse-2b9", "efuse-2d0",
+				   "efuse-222", "efuse-24c";
+		ieee80211-freq-limit = <5000000 5900000>;
+	};
 };
 
 &pcie_phy {
@@ -200,7 +210,27 @@
 					#size-cells = <1>;
 
 					macaddr_cfg_7: macaddr@7 {
+						compatible = "mac-base";
 						reg = <0x7 0x6>;
+						#nvmem-cell-cells = <1>;
+					};
+
+					/* 5 GHz crystal cap and thermal A/B */
+					cal_cfg_14: calibration@14 {
+						reg = <0x14 0x1>;
+					};
+
+					cal_cfg_16: calibration@16 {
+						reg = <0x16 0x2>;
+					};
+
+					/* 5 GHz BW40 1SS TSSI, path A and B */
+					cal_cfg_f4: calibration@f4 {
+						reg = <0xf4 0xe>;
+					};
+
+					cal_cfg_1b8: calibration@1b8 {
+						reg = <0x1b8 0xe>;
 					};
 				};
 			};
