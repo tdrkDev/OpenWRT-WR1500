@@ -148,6 +148,15 @@
 	status = "okay";
 };
 
+/* RTL8832BR 5 GHz radio */
+&pcie {
+	status = "okay";
+};
+
+&pcie_phy {
+	status = "okay";
+};
+
 &pinmux {
 	/* PIN_MUX_SEL17[27:24]: E2 (WPS button) as GPIO */
 	pinmux_gpio_e2: gpio-e2 {

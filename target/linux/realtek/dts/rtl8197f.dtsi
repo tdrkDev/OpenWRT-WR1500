@@ -47,7 +47,7 @@
 		/* System controller: chip ID, clock gates, pad and strap settings */
 		sysctl: syscon@0 {
 			compatible = "realtek,rtl8197f-sysctl", "syscon";
-			reg = <0x0 0x100>;
+			reg = <0x0 0x200>;
 		};
 
 		/*
@@ -58,6 +58,7 @@
 			compatible = "realtek,rtl8197f-intc", "realtek,rtl-intc";
 			reg = <0x3000 0x18>;
 			interrupt-controller;
+			#address-cells = <0>;
 			#interrupt-cells = <2>;
 
 			interrupt-parent = <&cpuintc>;
@@ -170,6 +171,35 @@
 			reg-shift = <2>;
 			fifo-size = <16>;
 			no-loopback-test;
+
+			status = "disabled";
+		};
+
+		pcie: pcie@b00000 {
+			compatible = "realtek,rtl8197f-pcie";
+			reg = <0xb00000 0x1000>, <0xb0100c 0x4>, <0xb10000 0x1000>;
+			reg-names = "hostcfg", "hostext", "devcfg";
+			realtek,sysctl = <&sysctl>;
+			phys = <&pcie_phy>;
+
+			device_type = "pci";
+			#address-cells = <3>;
+			#size-cells = <2>;
+			ranges = <0x01000000 0 0x00000000 0xc00000 0 0x10000>,
+				 <0x02000000 0 0x19000000 0x1000000 0 0x1000000>;
+
+			#interrupt-cells = <1>;
+			interrupt-map-mask = <0 0 0 0>;
+			interrupt-map = <0 0 0 0 &intc 21 3>;
+
+			status = "disabled";
+		};
+
+		pcie_phy: pcie-phy@b01000 {
+			compatible = "realtek,rtl8197f-pcie-phy";
+			reg = <0xb01000 0xc>;
+			realtek,pcie-misc = <&sysctl>;
+			#phy-cells = <0>;
 
 			status = "disabled";
 		};

@@ -37,6 +37,21 @@
 #define PHY_ADDR_0X09			0x09
 #define REG_0X09_FORCE_CALIBRATION	BIT(9)
 
+/* RTL8197F system controller registers, reached through realtek,pcie-misc */
+#define RTL8197F_SYS_REVR		0x000
+#define RTL8197F_SYS_REVR_ID		GENMASK(31, 12)
+#define RTL8197F_SYS_REVR_ID_VG		0x81970
+#define RTL8197F_SYS_STRAP		0x008
+#define RTL8197F_STRAP_CLK_40MHZ	BIT(24)
+#define RTL8197F_SYS_CLK_MANAGE		0x010
+#define RTL8197F_CLK_PCIE_LX		(BIT(12) | BIT(13))
+#define RTL8197F_CLK_PCIE_ACTIVE	BIT(14)
+#define RTL8197F_CLK_PCIE_PHY		BIT(18)
+#define RTL8197F_SYS_PCIE_PHY		0x100
+#define RTL8197F_PCIE_PHY_EN		BIT(3)
+#define RTL8197F_PCIE_PHY_LOAD_DONE	BIT(1)
+#define RTL8197F_PCIE_PHY_MDIO_RSTN	BIT(0)
+
 struct phy_data {
 	u8 page;
 	u8 addr;
@@ -49,6 +64,7 @@ struct phy_cfg {
 	bool do_toggle;
 	u32 mdio_reset_bit;
 	u32 disable_bit;
+	const struct phy_ops *ops;
 };
 
 struct rtk_phy {
@@ -229,6 +245,146 @@ static const struct phy_ops ops = {
 	.owner		= THIS_MODULE,
 };
 
+/*
+ * The RTL8197F MDIO register has no status bits; the vendor code waits a
+ * little after each write instead.
+ */
+static int rtl8197f_phy_write(struct rtk_phy *rtk_phy, u8 addr, u16 data)
+{
+	int ret;
+
+	ret = regmap_write(rtk_phy->regmap, PCIE_MDIO_CTRL_PHY_REG,
+			   FIELD_PREP(PCIE_MDIO_CTRL_PHY_DATA_MASK, data) |
+			   FIELD_PREP(PCIE_MDIO_CTRL_PHY_ADDR_MASK, addr) |
+			   PCIE_MDIO_CTRL_PHY_WRITE);
+	usleep_range(100, 200);
+
+	return ret;
+}
+
+static int rtl8197f_phy_reset(struct rtk_phy *rtk_phy)
+{
+	int ret;
+
+	ret = regmap_write(rtk_phy->regmap, PCIE_PHY_POWER_CTRL_REG,
+			   ENABLE_LTSSM_BIT);
+	if (ret)
+		return ret;
+
+	return regmap_write(rtk_phy->regmap, PCIE_PHY_POWER_CTRL_REG,
+			    ENABLE_LTSSM_BIT | PHY_RESET_BIT);
+}
+
+static const struct phy_data rtl8197f_40mhz_param[] = {
+	{0x0, 0x0f, 0x12f6}, {0x0, 0x00, 0x0071}, {0x0, 0x06, 0x1ac1}, { }
+};
+
+static const struct phy_data rtl8197f_25mhz_param[] = {
+	{0x0, 0x00, 0x0071}, {0x0, 0x06, 0x18c1}, { }
+};
+
+/*
+ * The controller and PHY of the RTL8197F are clocked and reset through the
+ * system controller. Nothing in the controller may be read before the PHY
+ * reset below: the access stalls the bus.
+ */
+static int rtl8197f_phy_init(struct phy *phy)
+{
+	struct rtk_phy *rtk_phy = phy_get_drvdata(phy);
+	struct regmap *sys = rtk_phy->pcie_misc_map;
+	const struct phy_data *param;
+	u32 revr, strap;
+	bool clk_40mhz;
+	int ret;
+
+	ret = regmap_read(sys, RTL8197F_SYS_REVR, &revr);
+	if (ret)
+		return ret;
+
+	ret = regmap_read(sys, RTL8197F_SYS_STRAP, &strap);
+	if (ret)
+		return ret;
+
+	ret = regmap_set_bits(sys, RTL8197F_SYS_CLK_MANAGE,
+			      RTL8197F_CLK_PCIE_LX | RTL8197F_CLK_PCIE_PHY);
+	if (ret)
+		return ret;
+
+	ret = regmap_set_bits(sys, RTL8197F_SYS_CLK_MANAGE,
+			      RTL8197F_CLK_PCIE_ACTIVE);
+	if (ret)
+		return ret;
+
+	usleep_range(10000, 11000);
+
+	/* MDIO reset, then mark the PHY parameters as loaded */
+	ret = regmap_write(sys, RTL8197F_SYS_PCIE_PHY, RTL8197F_PCIE_PHY_EN);
+	if (ret)
+		goto err_disable;
+
+	ret = regmap_write(sys, RTL8197F_SYS_PCIE_PHY,
+			   RTL8197F_PCIE_PHY_EN | RTL8197F_PCIE_PHY_MDIO_RSTN);
+	if (ret)
+		goto err_disable;
+
+	ret = regmap_write(sys, RTL8197F_SYS_PCIE_PHY,
+			   RTL8197F_PCIE_PHY_EN | RTL8197F_PCIE_PHY_LOAD_DONE |
+			   RTL8197F_PCIE_PHY_MDIO_RSTN);
+	if (ret)
+		goto err_disable;
+
+	usleep_range(10000, 11000);
+
+	ret = rtl8197f_phy_reset(rtk_phy);
+	if (ret)
+		goto err_disable;
+
+	usleep_range(10000, 11000);
+
+	clk_40mhz = strap & RTL8197F_STRAP_CLK_40MHZ;
+	param = clk_40mhz ? rtl8197f_40mhz_param : rtl8197f_25mhz_param;
+	for (; param->addr || param->data; param++) {
+		ret = rtl8197f_phy_write(rtk_phy, param->addr, param->data);
+		if (ret)
+			goto err_disable;
+	}
+
+	if (clk_40mhz &&
+	    FIELD_GET(RTL8197F_SYS_REVR_ID, revr) == RTL8197F_SYS_REVR_ID_VG) {
+		ret = rtl8197f_phy_write(rtk_phy, 0x08, 0x3101);
+		if (ret)
+			goto err_disable;
+	}
+
+	usleep_range(10000, 11000);
+
+	/* The new parameters take effect with another PHY reset */
+	ret = rtl8197f_phy_reset(rtk_phy);
+	if (ret)
+		goto err_disable;
+
+	return 0;
+
+err_disable:
+	regmap_clear_bits(sys, RTL8197F_SYS_CLK_MANAGE, RTL8197F_CLK_PCIE_ACTIVE);
+
+	return ret;
+}
+
+static int rtl8197f_phy_exit(struct phy *phy)
+{
+	struct rtk_phy *rtk_phy = phy_get_drvdata(phy);
+
+	return regmap_clear_bits(rtk_phy->pcie_misc_map, RTL8197F_SYS_CLK_MANAGE,
+				 RTL8197F_CLK_PCIE_ACTIVE);
+}
+
+static const struct phy_ops rtl8197f_ops = {
+	.init		= rtl8197f_phy_init,
+	.exit		= rtl8197f_phy_exit,
+	.owner		= THIS_MODULE,
+};
+
 static int rtk_pcie_phy_probe(struct platform_device *pdev)
 {
 	static const struct regmap_config regmap_config = {
@@ -275,7 +431,7 @@ static int rtk_pcie_phy_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, rtk_phy);
 
-	rtk_phy->phy = devm_phy_create(dev, NULL, &ops);
+	rtk_phy->phy = devm_phy_create(dev, NULL, phy_cfg->ops ?: &ops);
 	if (IS_ERR(rtk_phy->phy))
 		return dev_err_probe(dev, PTR_ERR(rtk_phy->phy),
 				     "Failed to create PCIe phy\n");
@@ -361,7 +517,12 @@ static const struct phy_cfg rtl9607c_revA_gen1x1_phy_cfg = {
 	.disable_bit = PCIE_PHY_CTRL_DIS1,
 };
 
+static const struct phy_cfg rtl8197f_phy_cfg = {
+	.ops = &rtl8197f_ops,
+};
+
 static const struct of_device_id rtk_pcie_phy_dt_match[] = {
+	{ .compatible = "realtek,rtl8197f-pcie-phy", .data = &rtl8197f_phy_cfg },
 	{ .compatible = "realtek,rtl9607c-revA-gen1x1-pcie-phy", .data = &rtl9607c_revA_gen1x1_phy_cfg },
 	{ .compatible = "realtek,rtl9607c-revA-gen2x1-pcie-phy", .data = &rtl9607c_revA_gen2x1_phy_cfg },
 	{ .compatible = "realtek,rtl9607c-revB-gen1x1-pcie-phy", .data = &rtl9607c_revB_gen1x1_phy_cfg },

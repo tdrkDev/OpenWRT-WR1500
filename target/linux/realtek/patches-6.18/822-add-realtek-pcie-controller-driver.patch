@@ -5,13 +5,13 @@
  	  This selects a driver for the MediaTek MT7621 PCIe Controller.
  
 +config PCIE_REALTEK
-+	bool "Realtek PCIe controller"
-+	depends on (MACH_REALTEK_RTL && RTL960X) || COMPILE_TEST
++	tristate "Realtek PCIe controller"
++	depends on (MACH_REALTEK_RTL && (RTL8197F || RTL960X)) || COMPILE_TEST
 +	select PHY_RTK_PCIEPHY
 +	default MACH_REALTEK_RTL && RTL960X
 +	help
 +	  Say Y here to enable PCIe controller support for the Realtek SoCs
-+	  like RTL9607C.
++	  like RTL8197F and RTL9607C.
 +
  config PCI_HYPERV_INTERFACE
  	tristate "Microsoft Hyper-V PCI Interface"

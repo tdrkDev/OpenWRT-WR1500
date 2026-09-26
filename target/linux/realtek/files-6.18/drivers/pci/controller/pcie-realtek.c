@@ -8,13 +8,19 @@
 #include <linux/gpio/consumer.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
+#include <linux/mfd/syscon.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/pci.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
+#include <linux/regmap.h>
 
 #include "../pci.h"
+
+/* RTL8197F system controller: PERST# of the PCIE_RSTN pin */
+#define RTL8197F_SYS_ENABLE	0x50
+#define RTL8197F_PCIE_PERST_N	BIT(1)
 
 /* Host config register offsets */
 #define RTPCIE_HOSTCFG_CAP	0x70
@@ -24,22 +30,37 @@
 #define RTPCIE_LINKUP_MASK	GENMASK(4, 0)
 #define RTPCIE_IS_LINKUP	(BIT(4) | BIT(0))
 #define RTPCIE_PCI_CMD_BIT20	BIT(20)
+
+/**
+ * struct rtpcie_soc_data - SoC specific details
+ * @sysctl_perst: PERST# is driven by the system controller, not a GPIO
+ * @speed_change: start a speed change after the link is up
+ */
+struct rtpcie_soc_data {
+	bool sysctl_perst;
+	bool speed_change;
+};
+
 /**
  * struct rtpcie_ctrl - Realtek PCIe port information
  * @dev: pointer to PCIe device
+ * @soc: SoC specific details
  * @hostcfg_base: host config register base
  * @hostext_base: host extension register base
  * @devcfg_base: device config register base
  * @reset_gpio: gpio reset
+ * @sysctl: system controller, for PERST# when @soc->sysctl_perst is set
  * @phy: pointer to PHY control block
  * @bus_number: assigned PCI bus number
  */
 struct rtpcie_ctrl {
 	struct device *dev;
+	const struct rtpcie_soc_data *soc;
 	void __iomem *hostcfg_base;
 	void __iomem *hostext_base;
 	void __iomem *devcfg_base;
 	struct gpio_desc *reset_gpio;
+	struct regmap *sysctl;
 	struct phy *phy;
 	u8 bus_number;
 };
@@ -72,6 +93,16 @@ static struct pci_ops rtpcie_ops = {
 	.write = pci_generic_config_write,
 };
 
+static void rtpcie_perst(struct rtpcie_ctrl *pcie, bool assert)
+{
+	if (pcie->soc->sysctl_perst)
+		regmap_update_bits(pcie->sysctl, RTL8197F_SYS_ENABLE,
+				   RTL8197F_PCIE_PERST_N,
+				   assert ? 0 : RTL8197F_PCIE_PERST_N);
+	else
+		gpiod_set_value_cansleep(pcie->reset_gpio, assert);
+}
+
 static int rtpcie_hw_init(struct rtpcie_ctrl *pcie)
 {
 	u16 devctl, link;
@@ -79,7 +110,7 @@ static int rtpcie_hw_init(struct rtpcie_ctrl *pcie)
 	u32 val;
 
 	/* Assert reset pcie */
-	gpiod_set_value_cansleep(pcie->reset_gpio, 1);
+	rtpcie_perst(pcie, true);
 
 	err = phy_init(pcie->phy);
 	if (err) {
@@ -87,8 +118,12 @@ static int rtpcie_hw_init(struct rtpcie_ctrl *pcie)
 		return err;
 	}
 
+	/* The system controller PERST# has only been asserted just now */
+	if (pcie->soc->sysctl_perst)
+		msleep(100);
+
 	/* Deassert reset pcie */
-	gpiod_set_value_cansleep(pcie->reset_gpio, 0);
+	rtpcie_perst(pcie, false);
 
 	/* Wait for Link Up */
 	err = readl_poll_timeout(pcie->hostcfg_base + RTPCIE_LINK_STATUS, val,
@@ -112,10 +147,13 @@ static int rtpcie_hw_init(struct rtpcie_ctrl *pcie)
 	devctl &= ~PCI_EXP_DEVCTL_PAYLOAD;
 	writew(devctl, pcie->hostcfg_base + RTPCIE_HOSTCFG_CAP + PCI_EXP_DEVCTL);
 
-	val = readl(pcie->hostcfg_base + RTPCIE_HOSTCFG_ENABLE);
-	writel(val | RTPCIE_ENABLE_BIT17, pcie->hostcfg_base + RTPCIE_HOSTCFG_ENABLE);
+	if (pcie->soc->speed_change) {
+		val = readl(pcie->hostcfg_base + RTPCIE_HOSTCFG_ENABLE);
+		writel(val | RTPCIE_ENABLE_BIT17,
+		       pcie->hostcfg_base + RTPCIE_HOSTCFG_ENABLE);
 
-	usleep_range(1000, 2000);
+		usleep_range(1000, 2000);
+	}
 
 	link = readw(pcie->hostcfg_base + RTPCIE_HOSTCFG_CAP + PCI_EXP_LNKSTA);
 	dev_info(pcie->dev, "link up, %s\n",
@@ -137,6 +175,7 @@ static int rtpcie_probe(struct platform_device *pdev)
 
 	pcie = pci_host_bridge_priv(bridge);
 	pcie->dev = dev;
+	pcie->soc = of_device_get_match_data(dev);
 	pcie->bus_number = 0xff;
 	platform_set_drvdata(pdev, pcie);
 
@@ -155,10 +194,18 @@ static int rtpcie_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, PTR_ERR(pcie->devcfg_base),
 				     "failed to map devcfg\n");
 
-	pcie->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_OUT_LOW);
-	if (IS_ERR(pcie->reset_gpio))
-		return dev_err_probe(dev, PTR_ERR(pcie->reset_gpio),
-				     "failed to get reset GPIO\n");
+	if (pcie->soc->sysctl_perst) {
+		pcie->sysctl = syscon_regmap_lookup_by_phandle(dev->of_node,
+							       "realtek,sysctl");
+		if (IS_ERR(pcie->sysctl))
+			return dev_err_probe(dev, PTR_ERR(pcie->sysctl),
+					     "failed to get system controller\n");
+	} else {
+		pcie->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_OUT_LOW);
+		if (IS_ERR(pcie->reset_gpio))
+			return dev_err_probe(dev, PTR_ERR(pcie->reset_gpio),
+					     "failed to get reset GPIO\n");
+	}
 
 	pcie->phy = devm_of_phy_get(dev, dev->of_node, NULL);
 	if (IS_ERR(pcie->phy))
@@ -180,8 +227,17 @@ static int rtpcie_probe(struct platform_device *pdev)
 	return 0;
 }
 
+static const struct rtpcie_soc_data rtl8197f_pcie_data = {
+	.sysctl_perst = true,
+};
+
+static const struct rtpcie_soc_data rtl9607c_pcie_data = {
+	.speed_change = true,
+};
+
 static const struct of_device_id rtpcie_of_match[] = {
-	{ .compatible = "realtek,rtl9607c-pcie" },
+	{ .compatible = "realtek,rtl8197f-pcie", .data = &rtl8197f_pcie_data },
+	{ .compatible = "realtek,rtl9607c-pcie", .data = &rtl9607c_pcie_data },
 	{ /* sentinel */ }
 };
 MODULE_DEVICE_TABLE(of, rtpcie_of_match);
