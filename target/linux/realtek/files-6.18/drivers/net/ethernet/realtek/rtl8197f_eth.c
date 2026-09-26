@@ -185,7 +185,12 @@
 #define PKT_TYPE_UDP			6
 
 #define RTL8197F_ETH_DESC_WORDS		6
-#define RTL8197F_ETH_RX_RING		256
+/* RX ring: room for line-rate bursts while the CPU is busy elsewhere, e.g.
+ * with Wi-Fi; the size can be changed with ethtool -G
+ */
+#define RTL8197F_ETH_RX_RING		1024
+#define RTL8197F_ETH_RX_RING_MIN	64
+#define RTL8197F_ETH_RX_RING_MAX	1024
 #define RTL8197F_ETH_TX_RING		256
 #define RTL8197F_ETH_TX_PORTS		BIT(0)	/* port 0: RGMII */
 #define RTL8197F_ETH_FIFO_LOW		0xa0
@@ -237,8 +242,9 @@ struct rtl8197f_eth {
 	struct page_pool *page_pool;
 	struct rtl8197f_eth_desc *rx_ring;
 	dma_addr_t rx_ring_dma;
-	void *rx_buf[RTL8197F_ETH_RX_RING];
-	dma_addr_t rx_dma[RTL8197F_ETH_RX_RING];
+	void *rx_buf[RTL8197F_ETH_RX_RING_MAX];
+	dma_addr_t rx_dma[RTL8197F_ETH_RX_RING_MAX];
+	unsigned int rx_ring_size;
 	unsigned int rx_idx;
 
 	struct rtl8197f_eth_desc *tx_ring;
@@ -278,7 +284,7 @@ static void rtl8197f_eth_rx_give(struct rtl8197f_eth *eth, unsigned int idx)
 	struct rtl8197f_eth_desc *desc = &eth->rx_ring[idx];
 	u32 w0 = DESC_OWN | FIELD_PREP(RXD0_BUFSIZE, RTL8197F_ETH_RX_BUF_SIZE);
 
-	if (idx == RTL8197F_ETH_RX_RING - 1)
+	if (idx == eth->rx_ring_size - 1)
 		w0 |= DESC_EOR;
 
 	desc->w[1] = eth->rx_dma[idx];
@@ -395,7 +401,7 @@ static int rtl8197f_eth_rx(struct rtl8197f_eth *eth, int budget)
 
 give:
 		rtl8197f_eth_rx_give(eth, idx);
-		eth->rx_idx = (idx + 1) % RTL8197F_ETH_RX_RING;
+		eth->rx_idx = (idx + 1) % eth->rx_ring_size;
 		done++;
 	}
 
@@ -851,7 +857,7 @@ static void rtl8197f_eth_hw_stop(struct rtl8197f_eth *eth)
 
 static void rtl8197f_eth_hw_start(struct rtl8197f_eth *eth)
 {
-	u32 ring_len = (RTL8197F_ETH_RX_RING - 1) * sizeof(struct rtl8197f_eth_desc);
+	u32 ring_len = (eth->rx_ring_size - 1) * sizeof(struct rtl8197f_eth_desc);
 	int i;
 
 	rtl8197f_eth_hw_stop(eth);
@@ -909,7 +915,7 @@ static void rtl8197f_eth_free_rings(struct rtl8197f_eth *eth)
 {
 	int i;
 
-	for (i = 0; i < RTL8197F_ETH_RX_RING; i++) {
+	for (i = 0; i < eth->rx_ring_size; i++) {
 		if (!eth->rx_buf[i])
 			continue;
 		page_pool_put_full_page(eth->page_pool,
@@ -929,7 +935,7 @@ static void rtl8197f_eth_free_rings(struct rtl8197f_eth *eth)
 	}
 
 	if (eth->rx_ring)
-		dma_free_coherent(eth->dev, RTL8197F_ETH_RX_RING * sizeof(*eth->rx_ring),
+		dma_free_coherent(eth->dev, eth->rx_ring_size * sizeof(*eth->rx_ring),
 				  eth->rx_ring, eth->rx_ring_dma);
 	if (eth->tx_ring)
 		dma_free_coherent(eth->dev, RTL8197F_ETH_TX_RING * sizeof(*eth->tx_ring),
@@ -946,7 +952,7 @@ static int rtl8197f_eth_alloc_rings(struct rtl8197f_eth *eth)
 {
 	struct page_pool_params pp_params = {
 		.flags = PP_FLAG_DMA_MAP,
-		.pool_size = RTL8197F_ETH_RX_RING,
+		.pool_size = eth->rx_ring_size,
 		.nid = NUMA_NO_NODE,
 		.dev = eth->dev,
 		.napi = &eth->napi,
@@ -964,7 +970,7 @@ static int rtl8197f_eth_alloc_rings(struct rtl8197f_eth *eth)
 	}
 
 	eth->rx_ring = dma_alloc_coherent(eth->dev,
-					  RTL8197F_ETH_RX_RING * sizeof(*eth->rx_ring),
+					  eth->rx_ring_size * sizeof(*eth->rx_ring),
 					  &eth->rx_ring_dma, GFP_KERNEL);
 	eth->tx_ring = dma_alloc_coherent(eth->dev,
 					  RTL8197F_ETH_TX_RING * sizeof(*eth->tx_ring),
@@ -972,7 +978,7 @@ static int rtl8197f_eth_alloc_rings(struct rtl8197f_eth *eth)
 	if (!eth->rx_ring || !eth->tx_ring)
 		goto err;
 
-	for (i = 0; i < RTL8197F_ETH_RX_RING; i++) {
+	for (i = 0; i < eth->rx_ring_size; i++) {
 		if (rtl8197f_eth_rx_alloc(eth, i))
 			goto err;
 		rtl8197f_eth_rx_give(eth, i);
@@ -1174,10 +1180,50 @@ static void rtl8197f_eth_get_ringparam(struct net_device *ndev,
 				       struct kernel_ethtool_ringparam *kernel_ring,
 				       struct netlink_ext_ack *extack)
 {
-	ring->rx_max_pending = RTL8197F_ETH_RX_RING;
+	struct rtl8197f_eth *eth = netdev_priv(ndev);
+
+	ring->rx_max_pending = RTL8197F_ETH_RX_RING_MAX;
 	ring->tx_max_pending = RTL8197F_ETH_TX_RING;
-	ring->rx_pending = RTL8197F_ETH_RX_RING;
+	ring->rx_pending = eth->rx_ring_size;
 	ring->tx_pending = RTL8197F_ETH_TX_RING;
+}
+
+static int rtl8197f_eth_set_ringparam(struct net_device *ndev,
+				      struct ethtool_ringparam *ring,
+				      struct kernel_ethtool_ringparam *kernel_ring,
+				      struct netlink_ext_ack *extack)
+{
+	struct rtl8197f_eth *eth = netdev_priv(ndev);
+	unsigned int old = eth->rx_ring_size;
+	int ret;
+
+	if (ring->tx_pending != RTL8197F_ETH_TX_RING) {
+		NL_SET_ERR_MSG(extack, "the TX ring size is fixed");
+		return -EINVAL;
+	}
+	if (ring->rx_pending < RTL8197F_ETH_RX_RING_MIN) {
+		NL_SET_ERR_MSG(extack, "RX ring too small");
+		return -EINVAL;
+	}
+	if (ring->rx_pending == old)
+		return 0;
+
+	if (!netif_running(ndev)) {
+		eth->rx_ring_size = ring->rx_pending;
+		return 0;
+	}
+
+	/* The rings are allocated at open, so restart with the new size */
+	rtl8197f_eth_stop(ndev);
+	eth->rx_ring_size = ring->rx_pending;
+	ret = rtl8197f_eth_open(ndev);
+	if (ret) {
+		eth->rx_ring_size = old;
+		if (rtl8197f_eth_open(ndev))
+			netdev_err(ndev, "failed to restart with the old ring\n");
+	}
+
+	return ret;
 }
 
 static const struct ethtool_ops rtl8197f_eth_ethtool_ops = {
@@ -1188,6 +1234,7 @@ static const struct ethtool_ops rtl8197f_eth_ethtool_ops = {
 	.get_regs_len = rtl8197f_eth_get_regs_len,
 	.get_regs = rtl8197f_eth_get_regs,
 	.get_ringparam = rtl8197f_eth_get_ringparam,
+	.set_ringparam = rtl8197f_eth_set_ringparam,
 };
 
 static void rtl8197f_eth_free_dsa_meta(void *data)
@@ -1237,6 +1284,7 @@ static int rtl8197f_eth_probe(struct platform_device *pdev)
 	eth->ndev = ndev;
 	eth->dev = dev;
 	INIT_WORK(&eth->reset_work, rtl8197f_eth_reset_work);
+	eth->rx_ring_size = RTL8197F_ETH_RX_RING;
 
 	eth->nic = devm_platform_ioremap_resource_byname(pdev, "nic");
 	if (IS_ERR(eth->nic))
