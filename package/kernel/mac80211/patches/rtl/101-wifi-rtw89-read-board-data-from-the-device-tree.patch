@@ -1,0 +1,221 @@
+From: Roman Rikhter <teledurak@gmail.com>
+Subject: [PATCH] wifi: rtw89: read board data from the device tree
+
+Routers keep the MAC address and the RF calibration of their radios in
+flash rather than in the chip's efuse. Let the device tree provide them:
+
+- nvmem cells named "efuse-<offset>" replace the logical efuse map at
+  <offset> before it is parsed;
+- a MAC address from the device tree takes precedence over the efuse;
+- "ieee80211-freq-limit" restricts the channels, and bands left without
+  any channel are dropped.
+
+When a band is dropped, the default channel that the radio is parked on
+while idle moves to the first band that remains, and frames still
+reported on a dropped band are discarded instead of warning in mac80211.
+
+Signed-off-by: Roman Rikhter <teledurak@gmail.com>
+---
+diff --git drivers/net/wireless/realtek/rtw89/chan.c drivers/net/wireless/realtek/rtw89/chan.c
+index 6f11335..d7a4c23 100644
+--- a/drivers/net/wireless/realtek/rtw89/chan.c
++++ b/drivers/net/wireless/realtek/rtw89/chan.c
+@@ -295,12 +295,33 @@ void rtw89_config_roc_chandef(struct rtw89_dev *rtwdev,
+ 
+ static void rtw89_config_default_chandef(struct rtw89_dev *rtwdev)
+ {
++	struct ieee80211_supported_band *sband;
+ 	struct cfg80211_chan_def chandef = {0};
++	int band;
+ 
+ 	rtw89_get_default_chandef(&chandef);
++
++	/* The board may lack the band of the default channel */
++	if (!rtwdev->hw->wiphy->bands[chandef.chan->band]) {
++		for (band = 0; band < NUM_NL80211_BANDS; band++) {
++			sband = rtwdev->hw->wiphy->bands[band];
++			if (!sband || !sband->n_channels)
++				continue;
++
++			cfg80211_chandef_create(&chandef, &sband->channels[0],
++						NL80211_CHAN_NO_HT);
++			break;
++		}
++	}
++
+ 	__rtw89_config_entity_chandef(rtwdev, RTW89_CHANCTX_0, &chandef);
+ }
+ 
++void rtw89_entity_config_default(struct rtw89_dev *rtwdev)
++{
++	rtw89_config_default_chandef(rtwdev);
++}
++
+ void rtw89_entity_init(struct rtw89_dev *rtwdev)
+ {
+ 	struct rtw89_hal *hal = &rtwdev->hal;
+diff --git drivers/net/wireless/realtek/rtw89/chan.h drivers/net/wireless/realtek/rtw89/chan.h
+index a9a5f1b..120faeb 100644
+--- a/drivers/net/wireless/realtek/rtw89/chan.h
++++ b/drivers/net/wireless/realtek/rtw89/chan.h
+@@ -172,6 +172,7 @@ void rtw89_config_roc_chandef(struct rtw89_dev *rtwdev,
+ 			      struct rtw89_vif_link *rtwvif_link,
+ 			      const struct cfg80211_chan_def *chandef);
+ void rtw89_entity_init(struct rtw89_dev *rtwdev);
++void rtw89_entity_config_default(struct rtw89_dev *rtwdev);
+ enum rtw89_entity_mode rtw89_entity_recalc(struct rtw89_dev *rtwdev);
+ bool rtw89_entity_check_hw(struct rtw89_dev *rtwdev, enum rtw89_phy_idx phy_idx);
+ void rtw89_entity_force_hw(struct rtw89_dev *rtwdev, enum rtw89_phy_idx phy_idx);
+diff --git drivers/net/wireless/realtek/rtw89/core.c drivers/net/wireless/realtek/rtw89/core.c
+index 68dad60..0d7df48 100644
+--- a/drivers/net/wireless/realtek/rtw89/core.c
++++ b/drivers/net/wireless/realtek/rtw89/core.c
+@@ -2,6 +2,7 @@
+ /* Copyright(c) 2019-2020  Realtek Corporation
+  */
+ #include <linux/ip.h>
++#include <linux/of_net.h>
+ #include <linux/sort.h>
+ #include <linux/udp.h>
+ 
+@@ -3989,6 +3990,12 @@ static void rtw89_core_rx_to_mac80211(struct rtw89_dev *rtwdev,
+ 	rtw89_core_update_rx_freq_from_ie(rtwdev, skb_ppdu, rx_status);
+ 	rtw89_core_correct_mcc_chan(rtwdev, desc_info, rx_status, phy_ppdu);
+ 
++	/* The board may lack the band that the radio is parked on */
++	if (unlikely(!rtwdev->hw->wiphy->bands[rx_status->band])) {
++		dev_kfree_skb_any(skb_ppdu);
++		return;
++	}
++
+ 	/* In low power mode, it does RX in thread context. */
+ 	local_bh_disable();
+ 	ieee80211_rx_napi(rtwdev->hw, NULL, skb_ppdu, napi);
+@@ -6324,6 +6331,31 @@ rtw89_core_sband_dup(struct rtw89_dev *rtwdev,
+ 	return dup;
+ }
+ 
++/* Drop the bands that the board's frequency limits leave without channels */
++static void rtw89_core_of_freq_limits(struct rtw89_dev *rtwdev)
++{
++	struct wiphy *wiphy = rtwdev->hw->wiphy;
++	struct ieee80211_supported_band *sband;
++	int band, i;
++
++	wiphy_read_of_freq_limits(wiphy);
++
++	for (band = 0; band < NUM_NL80211_BANDS; band++) {
++		sband = wiphy->bands[band];
++		if (!sband)
++			continue;
++
++		for (i = 0; i < sband->n_channels; i++)
++			if (!(sband->channels[i].flags & IEEE80211_CHAN_DISABLED))
++				break;
++
++		if (i == sband->n_channels)
++			wiphy->bands[band] = NULL;
++	}
++
++	rtw89_entity_config_default(rtwdev);
++}
++
+ static int rtw89_core_set_supported_band(struct rtw89_dev *rtwdev)
+ {
+ 	struct ieee80211_hw *hw = rtwdev->hw;
+@@ -6364,6 +6396,8 @@ static int rtw89_core_set_supported_band(struct rtw89_dev *rtwdev)
+ 		hw->wiphy->bands[NL80211_BAND_6GHZ] = sband;
+ 	}
+ 
++	rtw89_core_of_freq_limits(rtwdev);
++
+ 	return 0;
+ }
+ 
+@@ -7190,6 +7224,9 @@ static int rtw89_chip_efuse_info_setup(struct rtw89_dev *rtwdev)
+ 	if (ret)
+ 		return ret;
+ 
++	/* a MAC address in the device tree takes precedence */
++	of_get_mac_address(rtwdev->dev->of_node, rtwdev->efuse.addr);
++
+ 	ret = mac->parse_phycap_map(rtwdev);
+ 	if (ret)
+ 		return ret;
+diff --git drivers/net/wireless/realtek/rtw89/efuse.c drivers/net/wireless/realtek/rtw89/efuse.c
+index 89d4b1b..292bc08 100644
+--- a/drivers/net/wireless/realtek/rtw89/efuse.c
++++ b/drivers/net/wireless/realtek/rtw89/efuse.c
+@@ -2,6 +2,9 @@
+ /* Copyright(c) 2019-2020  Realtek Corporation
+  */
+ 
++#include <linux/nvmem-consumer.h>
++#include <linux/of.h>
++
+ #include "debug.h"
+ #include "efuse.h"
+ #include "mac.h"
+@@ -278,6 +281,53 @@ static int rtw89_dump_logical_efuse_map(struct rtw89_dev *rtwdev, u8 *phy_map,
+ 	return 0;
+ }
+ 
++/*
++ * Boards that keep calibration outside the chip describe it as nvmem cells
++ * named "efuse-<offset>", which replace the logical efuse map at <offset>.
++ */
++static void rtw89_efuse_apply_nvmem(struct rtw89_dev *rtwdev, u8 *log_map,
++				    u32 log_size)
++{
++	struct device_node *np = rtwdev->dev->of_node;
++	struct property *prop;
++	struct nvmem_cell *cell;
++	const char *name;
++	unsigned int ofst;
++	size_t len;
++	void *buf;
++
++	of_property_for_each_string(np, "nvmem-cell-names", prop, name) {
++		if (sscanf(name, "efuse-%x", &ofst) != 1)
++			continue;
++
++		cell = nvmem_cell_get(rtwdev->dev, name);
++		if (IS_ERR(cell)) {
++			rtw89_warn(rtwdev, "failed to get nvmem cell %s: %ld\n",
++				   name, PTR_ERR(cell));
++			continue;
++		}
++
++		buf = nvmem_cell_read(cell, &len);
++		nvmem_cell_put(cell);
++		if (IS_ERR(buf)) {
++			rtw89_warn(rtwdev, "failed to read nvmem cell %s: %ld\n",
++				   name, PTR_ERR(buf));
++			continue;
++		}
++
++		if (ofst >= log_size || len > log_size - ofst) {
++			rtw89_warn(rtwdev, "nvmem cell %s exceeds efuse map\n",
++				   name);
++		} else {
++			memcpy(log_map + ofst, buf, len);
++			rtw89_info(rtwdev, "efuse 0x%x-0x%zx from nvmem\n",
++				   ofst, ofst + len - 1);
++		}
++
++		kfree(buf);
++	}
++}
++
+ int rtw89_parse_efuse_map_ax(struct rtw89_dev *rtwdev)
+ {
+ 	u32 phy_size = rtwdev->chip->physical_efuse_size;
+@@ -331,6 +381,8 @@ int rtw89_parse_efuse_map_ax(struct rtw89_dev *rtwdev)
+ 		goto out_free;
+ 	}
+ 
++	rtw89_efuse_apply_nvmem(rtwdev, log_map, full_log_size);
++
+ 	rtw89_hex_dump(rtwdev, RTW89_DBG_FW, "log_map: ", log_map, full_log_size);
+ 
+ 	ret = rtwdev->chip->ops->read_efuse(rtwdev, log_map, RTW89_EFUSE_BLOCK_IGNORE);
