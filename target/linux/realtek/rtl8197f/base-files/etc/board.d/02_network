@@ -9,6 +9,9 @@ rtl8197f_setup_interfaces()
 	case $board in
 	cudy,wr1500)
 		ucidef_set_interfaces_lan_wan "lan1 lan2 lan3" "wan"
+		# The 5 GHz radio reports no RX checksum, so GRO would have to
+		# checksum every received frame in software
+		ucidef_set_network_device_gro "phy0-ap0" 0
 		;;
 	*)
 		ucidef_set_interface_lan "eth0"
