@@ -10,19 +10,22 @@ Index: linux-6.18.52/drivers/net/ethernet/realtek/Kconfig
 ===================================================================
 --- linux-6.18.52.orig/drivers/net/ethernet/realtek/Kconfig
 +++ linux-6.18.52/drivers/net/ethernet/realtek/Kconfig
-@@ -146,6 +146,16 @@ config NET_RTL838X
+@@ -146,6 +146,19 @@ config NET_RTL838X
  	help
  	  Say Y here if you want to use the Realtek rtl838x Gbps Ethernet MAC.
  
 +config NET_RTL8197F
 +	tristate "Realtek RTL8197F switch core Ethernet support"
 +	depends on MACH_REALTEK_RTL || COMPILE_TEST
++	depends on NET_DSA || !NET_DSA
 +	depends on OF
 +	select MFD_SYSCON
 +	select PAGE_POOL
 +	help
 +	  Say Y here to use the CPU port of the switch core in Realtek
-+	  RTL8197F router SoCs.
++	  RTL8197F router SoCs. With an external Realtek switch as DSA
++	  switch, it can offload connections of a netfilter flowtable to
++	  the NAPT engine of the switch core.
 +
  config NET_RTL960X_GMAC
  	tristate "Realtek RTL960X Ethernet MAC support"
@@ -31,8 +34,9 @@ Index: linux-6.18.52/drivers/net/ethernet/realtek/Makefile
 ===================================================================
 --- linux-6.18.52.orig/drivers/net/ethernet/realtek/Makefile
 +++ linux-6.18.52/drivers/net/ethernet/realtek/Makefile
-@@ -12,3 +12,4 @@ obj-$(CONFIG_R8169) += r8169.o
+@@ -12,3 +12,5 @@ obj-$(CONFIG_R8169) += r8169.o
  obj-$(CONFIG_RTASE) += rtase/
  obj-$(CONFIG_NET_RTL838X) += rtl838x_eth.o
  obj-$(CONFIG_NET_RTL960X_GMAC) += rtl960x_gmac.o
-+obj-$(CONFIG_NET_RTL8197F) += rtl8197f_eth.o
++obj-$(CONFIG_NET_RTL8197F) += rtl8197f-eth.o
++rtl8197f-eth-y := rtl8197f_eth.o rtl8197f_nat.o

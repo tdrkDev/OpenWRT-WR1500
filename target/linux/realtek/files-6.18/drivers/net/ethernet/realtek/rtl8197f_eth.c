@@ -16,7 +16,8 @@
  * destination ports given in the TX descriptor. The driver acts as the DSA
  * conduit of the external switch: received frames carry the port as
  * metadata, and the port mask of the "rtl8_4" tag of transmitted frames is
- * moved into the descriptor.
+ * moved into the descriptor. Connections of a netfilter flowtable on the DSA
+ * user ports can then be offloaded to the switch core, see rtl8197f_nat.c.
  */
 
 #include <linux/bitfield.h>
@@ -43,8 +44,9 @@
 #include <linux/unaligned.h>
 #include <net/dsa.h>
 #include <net/dst_metadata.h>
-#include <net/flow_offload.h>
 #include <net/page_pool/helpers.h>
+
+#include "rtl8197f_eth.h"
 
 /* System controller registers */
 #define SYS_CLK_MANAGE			0x010
@@ -130,9 +132,6 @@
 #define   SW_SIRR_TRXRDY		BIT(0)
 #define SW_MEMCR			0x4234
 #define   SW_MEMCR_INIT			GENMASK(6, 0)
-#define SW_SWTCR0			0x4418
-#define   SW_SWTCR0_STOP_TLU_READY	BIT(19)
-#define   SW_SWTCR0_STOP_TLU		BIT(18)
 #define SW_FFCR				0x4428
 #define   SW_FFCR_UNK_UC_TO_CPU		BIT(1)
 #define   SW_FFCR_UNK_MC_TO_CPU		BIT(0)
@@ -143,28 +142,9 @@
 #define SW_VCR0				0x4a00
 #define   SW_VCR0_1Q_VID_IGNORE		BIT(31)
 #define   SW_VCR0_INGRESS_FILTER	GENMASK(8, 0)
-#define SW_PVCR(n)			(0x4a08 + 4 * (n))	/* two ports each */
-#define   SW_PVCR_PVID_EVEN		GENMASK(11, 0)
-#define   SW_PVCR_PVID_ODD		GENMASK(27, 16)
-#define SW_SWTACR			0x4d00
-#define   SW_SWTACR_CMD_FORCE		BIT(3)
-#define   SW_SWTACR_START		BIT(0)
-#define SW_SWTAA			0x4d08
-#define SW_TCR(n)			(0x4d20 + 4 * (n))
 
 /* Switch core tables */
 #define SW_TBL_ACL			0x0c0000
-#define SW_TBL_OFFSET(type, idx)	(((type) << 16) + (idx) * 32)
-#define SW_TBL_ADDR(type, idx)		(0xbb000000 + SW_TBL_OFFSET(type, idx))
-#define SW_TBL_L2			0
-#define   SW_TBL_L2_ENTRIES		1024
-#define   SW_TBL_L2_WORDS		2
-#define SW_TBL_VLAN			6
-#define   SW_TBL_VLAN_WORDS		3
-#define   SW_VLAN0_EXT_UNTAG		GENMASK(17, 15)
-#define   SW_VLAN0_UNTAG		GENMASK(14, 9)
-#define   SW_VLAN0_EXT_MEMBER		GENMASK(8, 6)
-#define   SW_VLAN_EXT_CPU		BIT(2)	/* extension port 2 is the CPU */
 
 /* Descriptor word 0, common to RX and TX */
 #define DESC_OWN			BIT(0)	/* owned by the switch core */
@@ -211,7 +191,6 @@
 #define RTL8197F_ETH_FIFO_LOW		0xa0
 #define RTL8197F_ETH_FIFO_HIGH		0xce
 #define RTL8197F_ETH_PORTS		8	/* of the external switch */
-#define RTL8197F_ETH_VID		1	/* switch core VLAN of all ports */
 #define RTL8197F_ETH_P0_PHY_ID		5	/* as the boot code sets it */
 #define RTL8197F_ETH_P0_RX_DELAY	5	/* as the boot code sets it */
 #define RTL8197F_ETH_DSA_TAG_LEN	8	/* "rtl8_4" tag of transmitted frames */
@@ -253,6 +232,7 @@ struct rtl8197f_eth {
 	struct rtl8197f_eth_stats stats;
 	bool cpu_tag;
 	struct metadata_dst *dsa_meta[RTL8197F_ETH_PORTS];
+	struct rtl8197f_nat *nat;
 
 	struct page_pool *page_pool;
 	struct rtl8197f_eth_desc *rx_ring;
@@ -746,33 +726,6 @@ static netdev_features_t rtl8197f_eth_features_check(struct sk_buff *skb,
 	return features;
 }
 
-static int rtl8197f_eth_tbl_write(struct rtl8197f_eth *eth, unsigned int type,
-				  unsigned int idx, const u32 *data,
-				  unsigned int words)
-{
-	u32 val;
-	int ret, i;
-
-	/* Stop the table lookup unit while the entry changes */
-	sw_rmw(eth, SW_SWTCR0, 0, SW_SWTCR0_STOP_TLU);
-	ret = readl_poll_timeout_atomic(eth->swcore + SW_SWTCR0, val,
-					val & SW_SWTCR0_STOP_TLU_READY, 1, 1000);
-	if (!ret)
-		ret = readl_poll_timeout_atomic(eth->swcore + SW_SWTACR, val,
-						!(val & SW_SWTACR_START), 1, 1000);
-	if (!ret) {
-		for (i = 0; i < words; i++)
-			writel(data[i], eth->swcore + SW_TCR(i));
-		writel(SW_TBL_ADDR(type, idx), eth->swcore + SW_SWTAA);
-		writel(SW_SWTACR_START | SW_SWTACR_CMD_FORCE, eth->swcore + SW_SWTACR);
-		ret = readl_poll_timeout_atomic(eth->swcore + SW_SWTACR, val,
-						!(val & SW_SWTACR_START), 1, 1000);
-	}
-	sw_rmw(eth, SW_SWTCR0, SW_SWTCR0_STOP_TLU, 0);
-
-	return ret;
-}
-
 /*
  * Reset the switch core and set up port 0 for an external switch on RGMII,
  * as the boot code does. The boot code turns the switch core off before it
@@ -867,8 +820,8 @@ static int rtl8197f_eth_setup_switch(struct rtl8197f_eth *eth)
 		       FIELD_PREP(SW_MACCR1_RMD_TAG, SW_MACCR1_RMD_TAG_NONE));
 	}
 
-	ret = rtl8197f_eth_tbl_write(eth, SW_TBL_VLAN, RTL8197F_ETH_VID, vlan,
-				     ARRAY_SIZE(vlan));
+	ret = rtl8197f_sw_tbl_write(eth->swcore, SW_TBL_VLAN, RTL8197F_ETH_VID,
+				    vlan, ARRAY_SIZE(vlan));
 	for (i = 0; i < 3; i++)
 		writel(FIELD_PREP(SW_PVCR_PVID_EVEN, RTL8197F_ETH_VID) |
 		       FIELD_PREP(SW_PVCR_PVID_ODD, RTL8197F_ETH_VID),
@@ -878,7 +831,8 @@ static int rtl8197f_eth_setup_switch(struct rtl8197f_eth *eth)
 	for (i = 0; i < 5; i++)
 		writel(SW_L2_LEARN_LIMIT_EN, eth->swcore + SW_L2_LEARN_LIMIT(i));
 	for (i = 0; !ret && i < SW_TBL_L2_ENTRIES; i++)
-		ret = rtl8197f_eth_tbl_write(eth, SW_TBL_L2, i, l2, ARRAY_SIZE(l2));
+		ret = rtl8197f_sw_tbl_write(eth->swcore, SW_TBL_L2, i, l2,
+					    ARRAY_SIZE(l2));
 
 	/* Without the VLAN, nothing reaches the CPU */
 	if (!ret && readl(eth->tables + SW_TBL_OFFSET(SW_TBL_VLAN,
@@ -1100,252 +1054,16 @@ static void rtl8197f_eth_tx_timeout(struct net_device *ndev, unsigned int txqueu
 	schedule_work(&eth->reset_work);
 }
 
-/* A connection of the flowtable in one direction */
-struct rtl8197f_eth_flow {
-	int in_port;			/* ports of the external switch */
-	int out_port;
-	u8 proto;
-	__be32 saddr, daddr;		/* as received */
-	__be16 sport, dport;
-	__be32 nat_saddr, nat_daddr;	/* as sent */
-	__be16 nat_sport, nat_dport;
-	struct ethhdr eth;		/* as sent */
-};
-
-/* The port of the external switch behind a DSA user port of ours */
-static int rtl8197f_eth_flow_port(struct rtl8197f_eth *eth,
-				  struct net_device *dev)
-{
-	struct dsa_port *dp;
-
-	if (!dev)
-		return -ENODEV;
-
-	dp = dsa_port_from_netdev(dev);
-	if (IS_ERR(dp) || dsa_port_to_conduit(dp) != eth->ndev)
-		return -EOPNOTSUPP;
-
-	return dp->index;
-}
-
-static int rtl8197f_eth_flow_mangle(struct rtl8197f_eth_flow *flow,
-				    const struct flow_action_entry *act)
-{
-	u32 val = ntohl(act->mangle.val);
-	unsigned int len = 4;
-	const u8 *src;
-	u8 *dst;
-
-	switch (act->mangle.htype) {
-	case FLOW_ACT_MANGLE_HDR_TYPE_ETH:
-		/*
-		 * Each MAC address comes as a 4 and a 2 byte part. The mask
-		 * keeps the bytes that the value does not set.
-		 */
-		if (act->mangle.offset > 8)
-			return -EOPNOTSUPP;
-		dst = (u8 *)&flow->eth + act->mangle.offset;
-		src = (const u8 *)&act->mangle.val;
-		if (act->mangle.mask == 0xffff) {
-			src += 2;
-			dst += 2;
-		}
-		if (act->mangle.mask)
-			len = 2;
-		memcpy(dst, src, len);
-		return 0;
-	case FLOW_ACT_MANGLE_HDR_TYPE_IP4:
-		if (act->mangle.offset == offsetof(struct iphdr, saddr))
-			flow->nat_saddr = (__force __be32)act->mangle.val;
-		else if (act->mangle.offset == offsetof(struct iphdr, daddr))
-			flow->nat_daddr = (__force __be32)act->mangle.val;
-		else
-			return -EOPNOTSUPP;
-		return 0;
-	case FLOW_ACT_MANGLE_HDR_TYPE_TCP:
-	case FLOW_ACT_MANGLE_HDR_TYPE_UDP:
-		/* Both ports are in the first word, the mask keeps the other */
-		if (act->mangle.offset)
-			return -EOPNOTSUPP;
-		if (act->mangle.mask == ~htonl(0xffff0000))
-			flow->nat_sport = htons(val >> 16);
-		else if (act->mangle.mask == ~htonl(0xffff))
-			flow->nat_dport = htons(val & 0xffff);
-		else
-			return -EOPNOTSUPP;
-		return 0;
-	default:
-		return -EOPNOTSUPP;
-	}
-}
-
-static int rtl8197f_eth_flow_parse(struct rtl8197f_eth *eth,
-				   struct flow_cls_offload *cls,
-				   struct rtl8197f_eth_flow *flow)
-{
-	struct flow_rule *rule = flow_cls_offload_flow_rule(cls);
-	struct flow_match_ipv4_addrs addrs;
-	struct flow_match_control control;
-	struct flow_match_basic basic;
-	struct flow_match_ports ports;
-	struct flow_match_meta meta;
-	struct flow_action_entry *act;
-	int i, ret;
-
-	memset(flow, 0, sizeof(*flow));
-
-	/* Routed IPv4 TCP and UDP, without VLAN or PPPoE */
-	if (!flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_META) ||
-	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CONTROL) ||
-	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_BASIC) ||
-	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_PORTS) ||
-	    flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_VLAN))
-		return -EOPNOTSUPP;
-
-	flow_rule_match_control(rule, &control);
-	if (control.key->addr_type != FLOW_DISSECTOR_KEY_IPV4_ADDRS)
-		return -EOPNOTSUPP;
-
-	flow_rule_match_basic(rule, &basic);
-	flow->proto = basic.key->ip_proto;
-	if (flow->proto != IPPROTO_TCP && flow->proto != IPPROTO_UDP)
-		return -EOPNOTSUPP;
-
-	flow_rule_match_meta(rule, &meta);
-	rcu_read_lock();
-	flow->in_port = rtl8197f_eth_flow_port(eth,
-		dev_get_by_index_rcu(dev_net(eth->ndev),
-				     meta.key->ingress_ifindex));
-	rcu_read_unlock();
-	if (flow->in_port < 0)
-		return flow->in_port;
-
-	flow_rule_match_ipv4_addrs(rule, &addrs);
-	flow->saddr = flow->nat_saddr = addrs.key->src;
-	flow->daddr = flow->nat_daddr = addrs.key->dst;
-	flow_rule_match_ports(rule, &ports);
-	flow->sport = flow->nat_sport = ports.key->src;
-	flow->dport = flow->nat_dport = ports.key->dst;
-
-	flow->out_port = -EOPNOTSUPP;
-	flow_action_for_each(i, act, &rule->action) {
-		switch (act->id) {
-		case FLOW_ACTION_MANGLE:
-			ret = rtl8197f_eth_flow_mangle(flow, act);
-			if (ret)
-				return ret;
-			break;
-		case FLOW_ACTION_REDIRECT:
-			flow->out_port = rtl8197f_eth_flow_port(eth, act->dev);
-			break;
-		case FLOW_ACTION_CSUM:
-			break;
-		default:
-			return -EOPNOTSUPP;
-		}
-	}
-	if (flow->out_port < 0)
-		return flow->out_port;
-
-	if (!is_valid_ether_addr(flow->eth.h_source) ||
-	    !is_valid_ether_addr(flow->eth.h_dest))
-		return -EINVAL;
-
-	return 0;
-}
-
-static int rtl8197f_eth_flow_replace(struct rtl8197f_eth *eth,
-				     struct flow_cls_offload *cls)
-{
-	struct rtl8197f_eth_flow flow;
-	int ret;
-
-	ret = rtl8197f_eth_flow_parse(eth, cls, &flow);
-	if (!net_ratelimit())
-		return -EOPNOTSUPP;
-
-	if (ret)
-		netdev_info(eth->ndev, "flow %lx: not offloadable (%d)\n",
-			    cls->cookie, ret);
-	else
-		netdev_info(eth->ndev,
-			    "flow %lx: %s %pI4:%u > %pI4:%u port %d > %d, sent as %pI4:%u > %pI4:%u %pM > %pM\n",
-			    cls->cookie,
-			    flow.proto == IPPROTO_TCP ? "tcp" : "udp",
-			    &flow.saddr, ntohs(flow.sport),
-			    &flow.daddr, ntohs(flow.dport),
-			    flow.in_port, flow.out_port,
-			    &flow.nat_saddr, ntohs(flow.nat_sport),
-			    &flow.nat_daddr, ntohs(flow.nat_dport),
-			    flow.eth.h_source, flow.eth.h_dest);
-
-	/* Nothing is offloaded yet, the flowtable forwards in software */
-	return -EOPNOTSUPP;
-}
-
-static int rtl8197f_eth_flow_block_cb(enum tc_setup_type type,
-				      void *type_data, void *cb_priv)
-{
-	struct flow_cls_offload *cls = type_data;
-	struct rtl8197f_eth *eth = cb_priv;
-
-	if (type != TC_SETUP_CLSFLOWER)
-		return -EOPNOTSUPP;
-
-	switch (cls->command) {
-	case FLOW_CLS_REPLACE:
-		return rtl8197f_eth_flow_replace(eth, cls);
-	default:
-		return -EOPNOTSUPP;
-	}
-}
-
-static LIST_HEAD(rtl8197f_eth_block_cb_list);
-
-/*
- * The flowtable offload of the DSA user ports ends up here. All user ports
- * share the flowtable's block, so bind it once and count the users.
- */
+/* The flowtable offload of the DSA user ports ends up here */
 static int rtl8197f_eth_setup_tc(struct net_device *ndev,
 				 enum tc_setup_type type, void *type_data)
 {
 	struct rtl8197f_eth *eth = netdev_priv(ndev);
-	flow_setup_cb_t *cb = rtl8197f_eth_flow_block_cb;
-	struct flow_block_offload *f = type_data;
-	struct flow_block_cb *block_cb;
 
-	if (type != TC_SETUP_FT || !eth->cpu_tag ||
-	    f->binder_type != FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
+	if (type != TC_SETUP_FT || !eth->nat)
 		return -EOPNOTSUPP;
 
-	f->driver_block_list = &rtl8197f_eth_block_cb_list;
-
-	switch (f->command) {
-	case FLOW_BLOCK_BIND:
-		block_cb = flow_block_cb_lookup(f->block, cb, eth);
-		if (block_cb) {
-			flow_block_cb_incref(block_cb);
-			return 0;
-		}
-		block_cb = flow_block_cb_alloc(cb, eth, eth, NULL);
-		if (IS_ERR(block_cb))
-			return PTR_ERR(block_cb);
-		flow_block_cb_incref(block_cb);
-		flow_block_cb_add(block_cb, f);
-		list_add_tail(&block_cb->driver_list, &rtl8197f_eth_block_cb_list);
-		return 0;
-	case FLOW_BLOCK_UNBIND:
-		block_cb = flow_block_cb_lookup(f->block, cb, eth);
-		if (!block_cb)
-			return -ENOENT;
-		if (!flow_block_cb_decref(block_cb)) {
-			flow_block_cb_remove(block_cb, f);
-			list_del(&block_cb->driver_list);
-		}
-		return 0;
-	default:
-		return -EOPNOTSUPP;
-	}
+	return rtl8197f_nat_setup_ft(eth->nat, type_data);
 }
 
 static const struct net_device_ops rtl8197f_eth_netdev_ops = {
@@ -1574,6 +1292,11 @@ static int rtl8197f_eth_probe(struct platform_device *pdev)
 		ret = rtl8197f_eth_alloc_dsa_meta(eth);
 		if (ret)
 			return ret;
+
+		/* NAPT offload needs the ports of the external switch */
+		eth->nat = rtl8197f_nat_create(dev, ndev, eth->swcore, eth->tables);
+		if (IS_ERR(eth->nat))
+			return PTR_ERR(eth->nat);
 	}
 
 	ndev->netdev_ops = &rtl8197f_eth_netdev_ops;
@@ -1617,8 +1340,12 @@ static void rtl8197f_eth_shutdown(struct platform_device *pdev)
 {
 	struct rtl8197f_eth *eth = platform_get_drvdata(pdev);
 
-	if (eth)
-		rtl8197f_eth_hw_stop(eth);
+	if (!eth)
+		return;
+
+	if (eth->nat)
+		rtl8197f_nat_shutdown(eth->nat);
+	rtl8197f_eth_hw_stop(eth);
 }
 
 static const struct of_device_id rtl8197f_eth_of_match[] = {
