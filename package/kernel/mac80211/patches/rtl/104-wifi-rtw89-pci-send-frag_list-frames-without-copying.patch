@@ -1,0 +1,291 @@
+From: Roman Rikhter <teledurak@gmail.com>
+Subject: [PATCH] wifi: rtw89: pci: send frag_list frames without copying
+
+mac80211 builds A-MSDUs by chaining the subframes to the first one as a
+frag_list. rtw89 doesn't declare TX_FRAG_LIST, so mac80211 copies every
+A-MSDU into a single buffer before handing it over. On a small CPU this
+copy costs a lot: on an RTL8197F (MIPS 24Kc) forwarding a TCP stream to
+a client at 270 Mbit/s, copying takes about a sixth of the CPU.
+
+With the v1 address info (RTL8852C and later), a TX descriptor carries
+up to ten buffers. Map each buffer of a non-linear frame on its own and
+give it address info entries of its own, and declare TX_FRAG_LIST with
+room for ten buffers. A frame that needs more entries is linearized as
+before.
+
+Signed-off-by: Roman Rikhter <teledurak@gmail.com>
+---
+diff --git drivers/net/wireless/realtek/rtw89/pci.c drivers/net/wireless/realtek/rtw89/pci.c
+index 8e5da90..4a26b5b 100644
+--- a/drivers/net/wireless/realtek/rtw89/pci.c
++++ b/drivers/net/wireless/realtek/rtw89/pci.c
+@@ -624,6 +624,24 @@ static void rtw89_pci_release_busy_txwd(struct rtw89_dev *rtwdev,
+ 	}
+ }
+ 
++static void rtw89_pci_tx_unmap_sg(struct rtw89_dev *rtwdev,
++				  struct rtw89_pci_tx_sg *sg)
++{
++	struct rtw89_pci *rtwpci = (struct rtw89_pci *)rtwdev->priv;
++	struct device *dev = &rtwpci->pdev->dev;
++	int i;
++
++	for (i = 0; i < sg->nr; i++) {
++		if (sg->seg[i].page)
++			dma_unmap_page(dev, sg->seg[i].dma, sg->seg[i].len,
++				       DMA_TO_DEVICE);
++		else
++			dma_unmap_single(dev, sg->seg[i].dma, sg->seg[i].len,
++					 DMA_TO_DEVICE);
++	}
++	kfree(sg);
++}
++
+ static void rtw89_pci_release_txwd_skb(struct rtw89_dev *rtwdev,
+ 				       struct rtw89_pci_tx_ring *tx_ring,
+ 				       struct rtw89_pci_tx_wd *txwd, u16 seq,
+@@ -648,8 +666,11 @@ static void rtw89_pci_release_txwd_skb(struct rtw89_dev *rtwdev,
+ 		skb_unlink(skb, &txwd->queue);
+ 
+ 		tx_data = RTW89_PCI_TX_SKB_CB(skb);
+-		dma_unmap_single(&rtwpci->pdev->dev, tx_data->dma, skb->len,
+-				 DMA_TO_DEVICE);
++		if (tx_data->sg)
++			rtw89_pci_tx_unmap_sg(rtwdev, tx_data->sg);
++		else
++			dma_unmap_single(&rtwpci->pdev->dev, tx_data->dma,
++					 skb->len, DMA_TO_DEVICE);
+ 
+ 		rtw89_pci_tx_status(rtwdev, tx_ring, skb, tx_status);
+ 	}
+@@ -1580,6 +1601,135 @@ u32 rtw89_pci_fill_txaddr_info_v1(struct rtw89_dev *rtwdev,
+ }
+ EXPORT_SYMBOL(rtw89_pci_fill_txaddr_info_v1);
+ 
++/*
++ * mac80211 chains the subframes of an A-MSDU as a frag_list. With the v1
++ * address info, each buffer of such a frame gets entries of its own, so
++ * that the frame needs no copy into a single buffer.
++ */
++static bool rtw89_pci_tx_frag_list_supported(struct rtw89_dev *rtwdev)
++{
++	const struct rtw89_pci_info *info = rtwdev->pci_info;
++
++	return info->fill_txaddr_info == rtw89_pci_fill_txaddr_info_v1;
++}
++
++static bool rtw89_pci_tx_sg_add(struct device *dev, struct rtw89_pci_tx_sg *sg,
++				u32 *entries, dma_addr_t dma, u32 len, bool page)
++{
++	if (dma_mapping_error(dev, dma))
++		return false;
++
++	sg->seg[sg->nr].dma = dma;
++	sg->seg[sg->nr].len = len;
++	sg->seg[sg->nr].page = page;
++	sg->nr++;
++
++	*entries += DIV_ROUND_UP(len, TXADDR_INFO_LENTHG_V1_MAX);
++
++	return *entries <= RTW89_TXADDR_INFO_NR_V1;
++}
++
++static bool rtw89_pci_tx_map_skb_bufs(struct device *dev,
++				      struct rtw89_pci_tx_sg *sg, u32 *entries,
++				      struct sk_buff *skb)
++{
++	struct skb_shared_info *shinfo = skb_shinfo(skb);
++	dma_addr_t dma;
++	int i;
++
++	if (skb_headlen(skb)) {
++		if (sg->nr == RTW89_TXADDR_INFO_NR_V1)
++			return false;
++		dma = dma_map_single(dev, skb->data, skb_headlen(skb),
++				     DMA_TO_DEVICE);
++		if (!rtw89_pci_tx_sg_add(dev, sg, entries, dma,
++					 skb_headlen(skb), false))
++			return false;
++	}
++
++	for (i = 0; i < shinfo->nr_frags; i++) {
++		const skb_frag_t *frag = &shinfo->frags[i];
++
++		if (sg->nr == RTW89_TXADDR_INFO_NR_V1)
++			return false;
++		dma = skb_frag_dma_map(dev, frag, 0, skb_frag_size(frag),
++				       DMA_TO_DEVICE);
++		if (!rtw89_pci_tx_sg_add(dev, sg, entries, dma,
++					 skb_frag_size(frag), true))
++			return false;
++	}
++
++	return true;
++}
++
++static struct rtw89_pci_tx_sg *rtw89_pci_tx_map_sg(struct rtw89_dev *rtwdev,
++						   struct sk_buff *skb)
++{
++	struct rtw89_pci *rtwpci = (struct rtw89_pci *)rtwdev->priv;
++	struct device *dev = &rtwpci->pdev->dev;
++	struct rtw89_pci_tx_sg *sg;
++	struct sk_buff *iter;
++	u32 entries = 0;
++
++	sg = kmalloc(sizeof(*sg), GFP_ATOMIC);
++	if (!sg)
++		return NULL;
++	sg->nr = 0;
++
++	if (!rtw89_pci_tx_map_skb_bufs(dev, sg, &entries, skb))
++		goto err;
++
++	skb_walk_frags(skb, iter) {
++		if (skb_has_frag_list(iter) ||
++		    !rtw89_pci_tx_map_skb_bufs(dev, sg, &entries, iter))
++			goto err;
++	}
++
++	return sg;
++
++err:
++	rtw89_pci_tx_unmap_sg(rtwdev, sg);
++	return NULL;
++}
++
++static u32 rtw89_pci_fill_txaddr_info_sg(void *txaddr_info_addr,
++					 const struct rtw89_pci_tx_sg *sg,
++					 u8 *add_info_nr)
++{
++	struct rtw89_pci_tx_addr_info_32_v1 *txaddr_info = txaddr_info_addr;
++	u32 remain, len;
++	u16 length_option;
++	dma_addr_t dma;
++	int i, n = 0;
++
++	for (i = 0; i < sg->nr; i++) {
++		dma = sg->seg[i].dma;
++		remain = sg->seg[i].len;
++
++		while (remain) {
++			len = min_t(u32, remain, TXADDR_INFO_LENTHG_V1_MAX);
++			remain -= len;
++
++			length_option = FIELD_PREP(B_PCIADDR_LEN_V1_MASK, len) |
++					FIELD_PREP(B_PCIADDR_LS_V1_MASK,
++						   !remain && i == sg->nr - 1);
++			length_option |= u16_encode_bits(upper_32_bits(dma),
++							 B_PCIADDR_HIGH_SEL_V1_MASK);
++			txaddr_info->length_opt = cpu_to_le16(length_option);
++			txaddr_info->dma_low_lsb = cpu_to_le16(FIELD_GET(GENMASK(15, 0), dma));
++			txaddr_info->dma_low_msb = cpu_to_le16(FIELD_GET(GENMASK(31, 16), dma));
++
++			dma += len;
++			txaddr_info++;
++			n++;
++		}
++	}
++
++	*add_info_nr = n;
++
++	return n * sizeof(*txaddr_info);
++}
++
+ static int rtw89_pci_txwd_submit(struct rtw89_dev *rtwdev,
+ 				 struct rtw89_pci_tx_ring *tx_ring,
+ 				 struct rtw89_pci_tx_wd *txwd,
+@@ -1597,14 +1747,27 @@ static int rtw89_pci_txwd_submit(struct rtw89_dev *rtwdev,
+ 	u32 txwd_len;
+ 	u32 txwp_len;
+ 	u32 txaddr_info_len;
+-	dma_addr_t dma;
++	dma_addr_t dma = 0;
+ 	int ret;
+ 
+-	dma = dma_map_single(&pdev->dev, skb->data, skb->len, DMA_TO_DEVICE);
+-	if (dma_mapping_error(&pdev->dev, dma)) {
+-		rtw89_err(rtwdev, "failed to map skb dma data\n");
+-		ret = -EBUSY;
+-		goto err;
++	tx_data->sg = NULL;
++	if (skb_is_nonlinear(skb)) {
++		if (rtw89_pci_tx_frag_list_supported(rtwdev))
++			tx_data->sg = rtw89_pci_tx_map_sg(rtwdev, skb);
++		if (!tx_data->sg && skb_linearize(skb)) {
++			ret = -ENOMEM;
++			goto err;
++		}
++	}
++
++	if (!tx_data->sg) {
++		dma = dma_map_single(&pdev->dev, skb->data, skb->len,
++				     DMA_TO_DEVICE);
++		if (dma_mapping_error(&pdev->dev, dma)) {
++			rtw89_err(rtwdev, "failed to map skb dma data\n");
++			ret = -EBUSY;
++			goto err;
++		}
+ 	}
+ 
+ 	tx_data->dma = dma;
+@@ -1621,9 +1784,16 @@ static int rtw89_pci_txwd_submit(struct rtw89_dev *rtwdev,
+ 
+ 	tx_ring->tx_cnt++;
+ 	txaddr_info_addr = txwd->vaddr + txwd_len + txwp_len;
+-	txaddr_info_len =
+-		rtw89_chip_fill_txaddr_info(rtwdev, txaddr_info_addr, skb->len,
+-					    dma, &desc_info->addr_info_nr);
++	if (tx_data->sg)
++		txaddr_info_len =
++			rtw89_pci_fill_txaddr_info_sg(txaddr_info_addr,
++						      tx_data->sg,
++						      &desc_info->addr_info_nr);
++	else
++		txaddr_info_len =
++			rtw89_chip_fill_txaddr_info(rtwdev, txaddr_info_addr,
++						    skb->len, dma,
++						    &desc_info->addr_info_nr);
+ 
+ 	txwd->len = txwd_len + txwp_len + txaddr_info_len;
+ 
+@@ -4925,6 +5095,11 @@ int rtw89_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 		goto err_deinit_napi;
+ 	}
+ 
++	if (rtw89_pci_tx_frag_list_supported(rtwdev)) {
++		ieee80211_hw_set(rtwdev->hw, TX_FRAG_LIST);
++		rtwdev->hw->max_tx_fragments = RTW89_TXADDR_INFO_NR_V1;
++	}
++
+ 	ret = rtw89_core_register(rtwdev);
+ 	if (ret) {
+ 		rtw89_err(rtwdev, "failed to register core\n");
+diff --git drivers/net/wireless/realtek/rtw89/pci.h drivers/net/wireless/realtek/rtw89/pci.h
+index f78b888..a43d9e4 100644
+--- a/drivers/net/wireless/realtek/rtw89/pci.h
++++ b/drivers/net/wireless/realtek/rtw89/pci.h
+@@ -1455,6 +1455,7 @@ struct rtw89_pci_info {
+ 
+ struct rtw89_pci_tx_data {
+ 	dma_addr_t dma;
++	struct rtw89_pci_tx_sg *sg;
+ };
+ 
+ struct rtw89_pci_rx_info {
+@@ -1502,6 +1503,16 @@ struct rtw89_pci_tx_addr_info_32_v1 {
+ 	__le16 dma_low_msb;
+ } __packed;
+ 
++/* DMA mappings of a frame sent from more than one buffer */
++struct rtw89_pci_tx_sg {
++	u8 nr;
++	struct {
++		dma_addr_t dma;
++		u32 len:31;
++		u32 page:1;
++	} seg[RTW89_TXADDR_INFO_NR_V1];
++};
++
+ #define RTW89_PCI_RPP_POLLUTED		BIT(31)
+ #define RTW89_PCI_RPP_SEQ		GENMASK(30, 16)
+ #define RTW89_PCI_RPP_TX_STATUS		GENMASK(15, 13)
