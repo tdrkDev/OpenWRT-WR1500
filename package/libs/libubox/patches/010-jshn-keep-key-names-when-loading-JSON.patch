@@ -1,0 +1,28 @@
+From: Roman Rikhter <teledurak@gmail.com>
+Subject: [PATCH] jshn: keep key names when loading JSON
+
+jshn -r writes every key of the loaded JSON with each character other
+than a letter or a digit replaced by '_'. jshn.sh already maps such keys
+to variable names itself and records the original name for json_dump,
+but it never sees the original name of a loaded key. A JSON file that is
+loaded and dumped again thus has "phy0-ap0" turned into "phy0_ap0", for
+example in board.json, which every board.d script loads and writes back.
+
+Write the key as it is, quoted for the single-quoted shell string.
+
+Signed-off-by: Roman Rikhter <teledurak@gmail.com>
+---
+--- a/jshn.c
++++ b/jshn.c
+@@ -94,7 +94,10 @@
+ static void write_key_string(const char *key)
+ {
+ 	while (*key) {
+-		putc(isalnum(*key) ? *key : '_', stdout);
++		if (*key == '\'')
++			fputs("'\\''", stdout);
++		else
++			putc(*key, stdout);
+ 		key++;
+ 	}
+ }
