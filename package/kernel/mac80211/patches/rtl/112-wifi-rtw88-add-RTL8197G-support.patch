@@ -419,7 +419,7 @@ index 9129bf1..1459563 100644
  			continue;
  		}
 diff --git drivers/net/wireless/realtek/rtw88/reg.h drivers/net/wireless/realtek/rtw88/reg.h
-index 08e9494..1ea92ba 100644
+index 08e9494..46c3019 100644
 --- a/drivers/net/wireless/realtek/rtw88/reg.h
 +++ b/drivers/net/wireless/realtek/rtw88/reg.h
 @@ -352,6 +352,8 @@
@@ -431,20 +431,21 @@ index 08e9494..1ea92ba 100644
  #define REG_H2C_HEAD		0x0244
  #define REG_H2C_TAIL		0x0248
  #define REG_H2C_READ_ADDR	0x024C
-@@ -491,6 +493,7 @@
+@@ -491,6 +493,8 @@
  #define BIT_DIS_SECOND_CCA	(BIT(0) | BIT(1))
  #define REG_HIQ_NO_LMT_EN	0x5A7
  #define REG_DTIM_COUNTER_ROOT	0x5A8
 +#define REG_DTIM_COUNT_GROUP1	0x5A4
++#define REG_HIQ_NO_LMT_EN_V2	0x5A8
  #define BIT_HIQ_NO_LMT_EN_ROOT	BIT(0)
  #define REG_TIMER0_SRC_SEL	0x05B4
  #define BIT_TSFT_SEL_TIMER0	(BIT(4) | BIT(5) | BIT(6))
 diff --git drivers/net/wireless/realtek/rtw88/rtw8197g.c drivers/net/wireless/realtek/rtw88/rtw8197g.c
 new file mode 100644
-index 0000000..e71889d
+index 0000000..691309b
 --- /dev/null
 +++ b/drivers/net/wireless/realtek/rtw88/rtw8197g.c
-@@ -0,0 +1,1519 @@
+@@ -0,0 +1,1524 @@
 +// SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 +/* Copyright(c) 2018-2019  Realtek Corporation
 + */
@@ -779,6 +780,11 @@ index 0000000..e71889d
 +	rtw_write8(rtwdev, REG_BCN_CTRL_CLINT0, WLAN_BCN_CTRL_CLT0);
 +	rtw_write8(rtwdev, REG_BCNDMATIM, WLAN_BCN_DMA_TIME);
 +	rtw_write8(rtwdev, REG_BCN_MAX_ERR, WLAN_BCN_MAX_ERR);
++	/* Send the high queue (broadcast and multicast) at once, as the
++	 * vendor driver does. Held for DTIM beacons it drains only a few
++	 * frames per beacon, fills its ring and stops the BE queue.
++	 */
++	rtw_write8(rtwdev, REG_HIQ_NO_LMT_EN_V2, 0xff);
 +
 +	/* WMAC configuration */
 +	rtw_write32(rtwdev, REG_MAR, WLAN_MULTI_ADDR);

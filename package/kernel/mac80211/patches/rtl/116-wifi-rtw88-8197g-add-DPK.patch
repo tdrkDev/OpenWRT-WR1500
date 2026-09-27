@@ -32,10 +32,10 @@ index 20dae48..612bfe4 100644
  	u8 dpk_band;
  	u8 dpk_ch;
 diff --git drivers/net/wireless/realtek/rtw88/rtw8197g.c drivers/net/wireless/realtek/rtw88/rtw8197g.c
-index baa6b76..386bc48 100644
+index 10bbac8..6a6d9c5 100644
 --- a/drivers/net/wireless/realtek/rtw88/rtw8197g.c
 +++ b/drivers/net/wireless/realtek/rtw88/rtw8197g.c
-@@ -1244,10 +1244,602 @@ static void rtw8197g_do_iqk(struct rtw_dev *rtwdev)
+@@ -1249,10 +1249,602 @@ static void rtw8197g_do_iqk(struct rtw_dev *rtwdev)
  			res[path].rx_x << 20 | res[path].rx_y << 8);
  }
  
@@ -639,7 +639,7 @@ index baa6b76..386bc48 100644
  }
  
  static void rtw8197g_pwr_track(struct rtw_dev *rtwdev)
-@@ -1734,6 +2326,7 @@ static const struct rtw_chip_ops rtw8197g_ops = {
+@@ -1739,6 +2331,7 @@ static const struct rtw_chip_ops rtw8197g_ops = {
  	.phy_calibration	= rtw8197g_phy_calibration,
  	.cck_pd_set		= rtw8197g_phy_cck_pd_set,
  	.pwr_track		= rtw8197g_pwr_track,

@@ -15,10 +15,10 @@ to -31 dB.
 Signed-off-by: Roman Rikhter <teledurak@gmail.com>
 ---
 diff --git drivers/net/wireless/realtek/rtw88/rtw8197g.c drivers/net/wireless/realtek/rtw88/rtw8197g.c
-index e71889d..baa6b76 100644
+index 691309b..10bbac8 100644
 --- a/drivers/net/wireless/realtek/rtw88/rtw8197g.c
 +++ b/drivers/net/wireless/realtek/rtw88/rtw8197g.c
-@@ -930,10 +930,324 @@ static void rtw8197g_false_alarm_statistics(struct rtw_dev *rtwdev)
+@@ -935,10 +935,324 @@ static void rtw8197g_false_alarm_statistics(struct rtw_dev *rtwdev)
  	rtw_write32_set(rtwdev, REG_RX_BREAK, BIT_COM_RX_GCK_EN);
  }
  
