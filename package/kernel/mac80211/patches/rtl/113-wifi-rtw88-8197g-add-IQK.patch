@@ -1,0 +1,360 @@
+From: Roman Rikhter <teledurak@gmail.com>
+Subject: [PATCH] wifi: rtw88: 8197g: add IQK
+
+The firmware of the RTL8197G has no IQK: port the one of the vendor
+driver, as far as it runs for this chip. For each path it calibrates TX,
+then RX in two steps (the second one runs with the result of the first
+in the TX IQC), and writes the results into the IQC registers of the
+NCTL page of the path. The vendor driver skips LOK and the RX gain
+searches, and so does this.
+
+With a phone 1 m away (2x2, HT20), the RX EVM of the 2SS rates goes from
+-25/-26 dB to -29/-29 dB, the one of the legacy OFDM rates from -28 dB
+to -31 dB.
+
+Signed-off-by: Roman Rikhter <teledurak@gmail.com>
+---
+diff --git drivers/net/wireless/realtek/rtw88/rtw8197g.c drivers/net/wireless/realtek/rtw88/rtw8197g.c
+index e71889d..baa6b76 100644
+--- a/drivers/net/wireless/realtek/rtw88/rtw8197g.c
++++ b/drivers/net/wireless/realtek/rtw88/rtw8197g.c
+@@ -930,10 +930,324 @@ static void rtw8197g_false_alarm_statistics(struct rtw_dev *rtwdev)
+ 	rtw_write32_set(rtwdev, REG_RX_BREAK, BIT_COM_RX_GCK_EN);
+ }
+ 
++/* IQK of the vendor driver: TX IQK, then the two RX IQK steps, for each
++ * path, with the results in the IQC registers of the NCTL page of the path.
++ * LOK and the RX gain searches are left out, as the vendor driver does.
++ */
++enum rtw8197g_iqk_step {
++	IQK_TX,
++	IQK_RX1,
++	IQK_RX2,
++};
++
++struct rtw8197g_iqk_result {
++	u32 tx_x, tx_y;
++	u32 rx_x, rx_y;
++	bool tx_fail;
++	bool rx_fail;
++};
++
++static void rtw8197g_iqk_sel_path(struct rtw_dev *rtwdev, u8 path)
++{
++	rtw_write32(rtwdev, REG_NCTL0_8197G, 0x8 | path << 1);
++}
++
++static void rtw8197g_iqk_path_off(struct rtw_dev *rtwdev)
++{
++	u8 path;
++
++	for (path = 0; path < rtwdev->hal.rf_path_num; path++) {
++		rtw8197g_iqk_sel_path(rtwdev, path);
++		rtw_write32_mask(rtwdev, 0x1bb8, BIT(20), 0x0);
++		rtw_write32_mask(rtwdev, 0x1bcc, 0x3f, 0x3f);
++		rtw_write_rf(rtwdev, path, RF_MODE, RFREG_MASK, 0x10000);
++	}
++}
++
++static void rtw8197g_iqk_rf_common(struct rtw_dev *rtwdev, u8 path, u32 rf56)
++{
++	rtw8197g_iqk_path_off(rtwdev);
++	rtw8197g_iqk_sel_path(rtwdev, path);
++	rtw_write_rf(rtwdev, path, 0xde, 0xc, 0x3);
++	rtw_write_rf(rtwdev, path, 0x56, 0x1fff, rf56);
++	rtw_write_rf(rtwdev, path, 0x8f, 0xe000, 0x6);
++	rtw_write_rf(rtwdev, path, 0x8f, BIT(1), 0x0);
++	rtw_write_rf(rtwdev, path, 0x54, 0x38000, 0x0);
++}
++
++static void rtw8197g_iqk_setting(struct rtw_dev *rtwdev, u8 path,
++				 enum rtw8197g_iqk_step step)
++{
++	switch (step) {
++	case IQK_TX:
++		rtw8197g_iqk_rf_common(rtwdev, path, 0x1c6e);
++		rtw_write_rf(rtwdev, path, 0xef, BIT(4), 0x1);
++		rtw_write_rf(rtwdev, path, 0x33, 0x1c000, 0x0);
++		rtw_write32_mask(rtwdev, 0x1b18, BIT(0), 0x0);
++		rtw_write32_mask(rtwdev, 0x1b1c, BIT(1) | BIT(0), 0x2);
++		rtw_write32_mask(rtwdev, 0x1b20, 0xfffff, 0x40008);
++		rtw_write32_mask(rtwdev, 0x1b2c, 0xfff, 0x018);
++		rtw_write32_mask(rtwdev, 0x1bcc, 0x3f, 0x9);
++		rtw_write32_mask(rtwdev, 0x1bcc, BIT(31), 0x1);
++		break;
++	case IQK_RX1:
++		rtw8197g_iqk_rf_common(rtwdev, path, 0x40);
++		rtw_write32_mask(rtwdev, 0x1b18, BIT(0), 0x1);
++		rtw_write32_mask(rtwdev, 0x1b1c, BIT(1) | BIT(0), 0x2);
++		rtw_write32_mask(rtwdev, 0x1b20, 0xfffff, 0x60008);
++		rtw_write32_mask(rtwdev, 0x1b2c, 0xfff, 0x018);
++		rtw_write32_mask(rtwdev, 0x1bcc, 0x3f, 0x9);
++		rtw_write32_mask(rtwdev, 0x1bcc, BIT(31), 0x1);
++		break;
++	case IQK_RX2:
++		rtw8197g_iqk_rf_common(rtwdev, path, 0x40);
++		rtw_write32_mask(rtwdev, 0x1bcc, 0x3f, 0x9);
++		rtw_write32_mask(rtwdev, 0x1b18, BIT(0), 0x1);
++		rtw_write32_mask(rtwdev, 0x1b18, BIT(1), 0x1);
++		rtw_write32_mask(rtwdev, 0x1b1c, BIT(1) | BIT(0), 0x1);
++		rtw_write32_mask(rtwdev, 0x1b24, 0xfffff, 0x71008);
++		rtw_write32_mask(rtwdev, 0x1b2c, 0xfff, 0x018);
++		rtw_write32_mask(rtwdev, 0x1bcc, BIT(30), 0x1);
++		rtw_write32_mask(rtwdev, 0x1b1c, BIT(29), 0x1);
++		break;
++	}
++}
++
++static u32 rtw8197g_iqk_report(struct rtw_dev *rtwdev, u32 sel)
++{
++	rtw_write32(rtwdev, 0x1bd4, sel);
++	return rtw_read32(rtwdev, 0x1bfc);
++}
++
++/* returns true when the calibration of this step failed */
++static bool rtw8197g_iqk_one_shot(struct rtw_dev *rtwdev, u8 path,
++				  enum rtw8197g_iqk_step step,
++				  struct rtw8197g_iqk_result *res)
++{
++	bool rx2 = step == IQK_RX2;
++	u32 val, iq_x, iq_y, bp, ex_bp;
++	bool fail = false;
++	int ret;
++
++	rtw_write32_mask(rtwdev, 0x1b34, BIT(0), 0x1);
++	rtw_write32_mask(rtwdev, 0x1b34, BIT(0), 0x0);
++	fsleep(1000);
++
++	ret = read_poll_timeout(rtw8197g_iqk_report, val, val & BIT(1),
++				1000, 100000, false, rtwdev, 0x001d0001);
++	if (ret)
++		rtw_dbg(rtwdev, RTW_DBG_RFK, "[IQK] S%d step %d timeout\n",
++			path, step);
++
++	rtw_write32_mask(rtwdev, 0x1bcc, rx2 ? BIT(30) : BIT(31), 0x0);
++	if (step == IQK_TX)
++		rtw_write_rf(rtwdev, path, 0xef, BIT(4), 0x0);
++
++	val = rtw8197g_iqk_report(rtwdev, rx2 ? 0x00160001 : 0x00150001);
++	iq_x = (val & 0x7ff0000) >> 16;
++	iq_y = val & 0x7ff;
++
++	val = rtw8197g_iqk_report(rtwdev, 0x001d0001);
++	if (rx2) {
++		fail = val & BIT(2);
++	} else if (val & BIT(3)) {
++		/* a bad image before the calibration is acceptable */
++		bp = rtw8197g_iqk_report(rtwdev, 0x00180001);
++		ex_bp = u32_get_bits(rtw8197g_iqk_report(rtwdev, 0x00170001),
++				     0x1f0000);
++		fail = !(bp < 0x10000 && ex_bp == 0);
++	}
++
++	rtw_dbg(rtwdev, RTW_DBG_RFK,
++		"[IQK] S%d step %d x 0x%x y 0x%x image 0x%x -> 0x%x%s\n",
++		path, step, iq_x, iq_y,
++		rtw8197g_iqk_report(rtwdev, rx2 ? 0x001b0001 : 0x00180001),
++		rtw8197g_iqk_report(rtwdev, rx2 ? 0x001c0001 : 0x00190001),
++		fail ? " fail" : "");
++
++	if (fail)
++		return true;
++
++	switch (step) {
++	case IQK_TX:
++		res->tx_x = iq_x;
++		res->tx_y = iq_y;
++		break;
++	case IQK_RX1:
++		/* the second RX step runs with the result of the first */
++		rtw8197g_iqk_sel_path(rtwdev, path);
++		rtw_write32(rtwdev, 0x1b38, (iq_x << 20) | (iq_y << 8));
++		break;
++	case IQK_RX2:
++		res->rx_x = iq_x;
++		res->rx_y = iq_y;
++		break;
++	}
++
++	return false;
++}
++
++/* TX IQK sets up again for each try, RX IQK only shoots again */
++static bool rtw8197g_iqk_retry(struct rtw_dev *rtwdev, u8 path,
++			       enum rtw8197g_iqk_step step, int tries,
++			       struct rtw8197g_iqk_result *res)
++{
++	bool fail = true;
++	bool setup = true;
++
++	while (fail && tries--) {
++		if (setup)
++			rtw8197g_iqk_setting(rtwdev, path, step);
++		setup = step == IQK_TX;
++		fail = rtw8197g_iqk_one_shot(rtwdev, path, step, res);
++	}
++
++	return fail;
++}
++
++static void rtw8197g_iqk_by_path(struct rtw_dev *rtwdev, u8 path,
++				 struct rtw8197g_iqk_result *res)
++{
++	/* the vendor retries TX IQK only on path B */
++	res->tx_fail = rtw8197g_iqk_retry(rtwdev, path, IQK_TX,
++					  path == RF_PATH_A ? 1 : 4, res);
++	res->rx_fail = rtw8197g_iqk_retry(rtwdev, path, IQK_RX1, 3, res) ||
++		       rtw8197g_iqk_retry(rtwdev, path, IQK_RX2, 3, res);
++}
++
++static void rtw8197g_iqk_macbb(struct rtw_dev *rtwdev)
++{
++	rtw_write8(rtwdev, REG_TXPAUSE, 0xff);
++	rtw_write32_mask(rtwdev, 0x1e24, BIT(31), 0x0);
++	rtw_write32_mask(rtwdev, 0x1e28, 0xf, 0x3);
++	rtw_write32_mask(rtwdev, REG_ANTMAP, 0xf0000, 0x3);
++	/* RF mode through the 3-wire ports: A 0x5, B 0x7 */
++	rtw_write32(rtwdev, 0x1808, 0x00050000);
++	rtw_write32(rtwdev, 0x4108, 0x00070000);
++	rtw_write32_mask(rtwdev, REG_CCKSB, 0x3, 0x2);
++	rtw_write32_mask(rtwdev, 0x1e24, BIT(17), 0x1);
++	/* CCA off */
++	rtw_write32_mask(rtwdev, 0x1d58, BIT(3), 0x1);
++	rtw_write32_mask(rtwdev, 0x1d58, 0xff0, 0xff);
++	rtw_write32_mask(rtwdev, 0x1864, BIT(31), 0x1);
++	rtw_write32_mask(rtwdev, 0x4164, BIT(31), 0x1);
++	rtw_write32_mask(rtwdev, REG_3WIRE, BIT(27), 0x1);
++	rtw_write32_mask(rtwdev, REG_3WIRE2, BIT(27), 0x1);
++	rtw_write32_mask(rtwdev, REG_3WIRE, 0x3, 0x0);
++	rtw_write32_mask(rtwdev, REG_3WIRE2, 0x3, 0x0);
++}
++
++static void rtw8197g_iqk_afe(struct rtw_dev *rtwdev, bool iqk)
++{
++	static const u32 afe_on[] = {0xB3001402, 0x06000141, 0x00000280, 0x0};
++	u32 base[2] = {0x1800, 0x4100};
++	u8 path;
++	u32 i;
++
++	if (iqk)
++		rtw_write32(rtwdev, 0x1c38, 0xffffffff);
++
++	for (path = 0; path < rtwdev->hal.rf_path_num; path++) {
++		u32 anapar = base[path] + 0x30;
++
++		if (!iqk) {
++			/* the normal mode settings of the vendor driver */
++			static const u32 afe_off[] = {
++				0x700b8041, 0x70144041, 0x70244041, 0x70344041,
++				0x70444041, 0x705b8041, 0x70644041, 0x707b8041,
++				0x708b8041, 0x709b8041, 0x70ab8041, 0x70bb8041,
++				0x70cb8041, 0x70db8041, 0x70eb8041, 0x70fb8041,
++			};
++
++			for (i = 0; i < ARRAY_SIZE(afe_off); i++)
++				rtw_write32(rtwdev, anapar, afe_off[i]);
++			continue;
++		}
++
++		for (i = 0; i < ARRAY_SIZE(afe_on); i++)
++			rtw_write32(rtwdev, base[path] + 0x10 + i * 4, afe_on[i]);
++
++		rtw_write32(rtwdev, anapar, 0x700f0001);
++		for (i = 0; i <= 0xf; i++)
++			rtw_write32(rtwdev, anapar, 0x700f0001 | i << 20);
++		rtw_write32(rtwdev, anapar, 0x70ff0001);
++	}
++}
++
++static void rtw8197g_do_iqk(struct rtw_dev *rtwdev)
++{
++	static const u32 mac_bb_regs[] = {
++		0x520, 0x550, 0x180c, 0x410c, 0x1c38, 0x1d58, 0x1864, 0x4164,
++		0x824, 0x1a00,
++	};
++	static const u32 rf_regs[] = {0xde, 0x8f};
++	struct rtw8197g_iqk_result res[RTW_RF_PATH_MAX] = {};
++	u32 mac_bb[ARRAY_SIZE(mac_bb_regs)];
++	u32 rf[ARRAY_SIZE(rf_regs)][RTW_RF_PATH_MAX];
++	u32 txiqc[RTW_RF_PATH_MAX];
++	u8 path_num = rtwdev->hal.rf_path_num;
++	u8 path;
++	u32 i;
++
++	for (path = 0; path < path_num; path++) {
++		rtw8197g_iqk_sel_path(rtwdev, path);
++		txiqc[path] = rtw_read32(rtwdev, 0x1b38);
++	}
++
++	for (i = 0; i < ARRAY_SIZE(mac_bb_regs); i++)
++		mac_bb[i] = rtw_read32(rtwdev, mac_bb_regs[i]);
++	for (i = 0; i < ARRAY_SIZE(rf_regs); i++)
++		for (path = 0; path < path_num; path++)
++			rf[i][path] = rtw_read_rf(rtwdev, path, rf_regs[i],
++						  RFREG_MASK);
++
++	rtw8197g_iqk_macbb(rtwdev);
++	rtw8197g_iqk_afe(rtwdev, true);
++
++	for (path = 0; path < path_num; path++)
++		rtw8197g_iqk_by_path(rtwdev, path, &res[path]);
++
++	for (path = 0; path < path_num; path++) {
++		rtw8197g_iqk_sel_path(rtwdev, path);
++		if (!res[path].tx_fail)
++			rtw_write32(rtwdev, 0x1b38, res[path].tx_x << 20 |
++						     res[path].tx_y << 8);
++		else
++			rtw_write32(rtwdev, 0x1b38, txiqc[path]);
++		if (!res[path].rx_fail)
++			rtw_write32(rtwdev, 0x1b3c, res[path].rx_x << 20 |
++						     res[path].rx_y << 8);
++		rtw_write8(rtwdev, 0x1bcc, 0x0);
++	}
++
++	rtw8197g_iqk_afe(rtwdev, false);
++
++	for (path = 0; path < path_num; path++) {
++		rtw_write_rf(rtwdev, path, 0xef, RFREG_MASK, 0x0);
++		for (i = 0; i < ARRAY_SIZE(rf_regs); i++)
++			rtw_write_rf(rtwdev, path, rf_regs[i], RFREG_MASK,
++				     rf[i][path]);
++		rtw_write_rf(rtwdev, path, 0xde, BIT(16), 0x0);
++	}
++
++	for (i = 0; i < ARRAY_SIZE(mac_bb_regs); i++)
++		rtw_write32(rtwdev, mac_bb_regs[i], mac_bb[i]);
++	/* let RX go through the IQ correction */
++	rtw_write32_mask(rtwdev, 0x1e24, BIT(31), 0x1);
++
++	for (path = 0; path < path_num; path++)
++		rtw_dbg(rtwdev, RTW_DBG_RFK,
++			"[IQK] S%d tx %s 0x%08x rx %s 0x%08x\n", path,
++			res[path].tx_fail ? "fail" : "ok",
++			res[path].tx_x << 20 | res[path].tx_y << 8,
++			res[path].rx_fail ? "fail" : "ok",
++			res[path].rx_x << 20 | res[path].rx_y << 8);
++}
++
+ static void rtw8197g_phy_calibration(struct rtw_dev *rtwdev)
+ {
+-	/* IQK, TSSI and DPK of the vendor driver are not ported yet */
+-	rtw_dbg(rtwdev, RTW_DBG_RFK, "no RF calibration for this chip yet\n");
++	/* TSSI and DPK of the vendor driver are not ported yet */
++	rtw8197g_do_iqk(rtwdev);
+ }
+ 
+ static void rtw8197g_pwr_track(struct rtw_dev *rtwdev)
+diff --git drivers/net/wireless/realtek/rtw88/rtw8197g.h drivers/net/wireless/realtek/rtw88/rtw8197g.h
+index b97322c..32d52c7 100644
+--- a/drivers/net/wireless/realtek/rtw88/rtw8197g.h
++++ b/drivers/net/wireless/realtek/rtw88/rtw8197g.h
+@@ -127,6 +127,8 @@ extern const struct rtw_chip_info rtw8197g_hw_spec;
+ #define REG_3WIRE2		0x410c
+ #define REG_RXAGCCTL		0x41ac
+ 
++#define REG_NCTL0_8197G		0x1b00
++
+ #define RF_T_METER_8197G	0x42
+ #define BIT_T_METER_TRIG	BIT(17)
+ 

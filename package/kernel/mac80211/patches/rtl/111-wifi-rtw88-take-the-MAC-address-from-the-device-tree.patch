@@ -1,0 +1,31 @@
+From: Roman Rikhter <teledurak@gmail.com>
+Subject: [PATCH] wifi: rtw88: take the MAC address from the device tree
+
+A WLAN MAC in a SoC has no MAC address of its own; the board keeps it
+in flash. Take the address from the device tree (a "mac-address" nvmem
+cell or property) when there is one.
+
+Signed-off-by: Roman Rikhter <teledurak@gmail.com>
+---
+diff --git drivers/net/wireless/realtek/rtw88/main.c drivers/net/wireless/realtek/rtw88/main.c
+index fe1d65e..eb5d1cb 100644
+--- a/drivers/net/wireless/realtek/rtw88/main.c
++++ b/drivers/net/wireless/realtek/rtw88/main.c
+@@ -3,6 +3,7 @@
+  */
+ 
+ #include <linux/devcoredump.h>
++#include <linux/of_net.h>
+ 
+ #include "main.h"
+ #include "regd.h"
+@@ -2060,6 +2061,9 @@ static int rtw_chip_efuse_info_setup(struct rtw_dev *rtwdev)
+ 	efuse->ext_pa_5g = efuse->pa_type_5g & BIT(0) ? 1 : 0;
+ 	efuse->ext_lna_5g = efuse->lna_type_5g & BIT(3) ? 1 : 0;
+ 
++	/* a MAC address from the device tree takes precedence */
++	of_get_mac_address(rtwdev->dev->of_node, efuse->addr);
++
+ 	if (!is_valid_ether_addr(efuse->addr)) {
+ 		eth_random_addr(efuse->addr);
+ 		dev_warn(rtwdev->dev, "efuse MAC invalid, using random\n");
