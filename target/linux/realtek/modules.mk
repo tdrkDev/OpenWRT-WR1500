@@ -45,7 +45,7 @@ define KernelPackage/hasivo-mcu-sensor
   TITLE:=Hasivo management MCU sensor driver
   KCONFIG:=CONFIG_SENSORS_HASIVO_MCU
   FILES:=$(LINUX_DIR)/drivers/hwmon/hasivo-mcu-sensor.ko
-  DEPENDS:=@TARGET_realtek +kmod-mfd-hasivo-stc8
+  DEPENDS:=@TARGET_realtek +kmod-hwmon-core +kmod-mfd-hasivo-stc8
   AUTOLOAD:=$(call AutoProbe,hasivo-mcu-sensor,1)
 endef
 
