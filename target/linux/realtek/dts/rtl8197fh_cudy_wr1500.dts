@@ -27,6 +27,16 @@
 		reg = <0x0 0x8000000>;
 	};
 
+	/*
+	 * CPU clock chosen with luci-app-cpuclk, applied at boot unless the
+	 * WPS button is held
+	 */
+	cpu-clock {
+		compatible = "realtek,rtl8197f-cpu-clock";
+		realtek,setting = <&partition_cpuclk>;
+		realtek,failsafe-key = <&key_wps>;
+	};
+
 	keys {
 		compatible = "gpio-keys";
 		pinctrl-names = "default";
@@ -38,7 +48,7 @@
 			linux,code = <KEY_RESTART>;
 		};
 
-		wps {
+		key_wps: wps {
 			label = "wps";
 			gpios = <&gpio1 2 GPIO_ACTIVE_LOW>;
 			linux,code = <KEY_WPS_BUTTON>;
@@ -261,10 +271,10 @@
 				read-only;
 			};
 
-			partition@ff0000 {
-				label = "backup";
+			/* An empty JFFS2 in the stock firmware */
+			partition_cpuclk: partition@ff0000 {
+				label = "cpuclk";
 				reg = <0xff0000 0x10000>;
-				read-only;
 			};
 		};
 	};
