@@ -1,0 +1,267 @@
+From: Roman Rikhter <teledurak@gmail.com>
+Subject: [PATCH] realtek: rtl8197f: apply the CPU clock stored in flash
+
+The RTL8197F boot code starts the CPU at 1000 MHz, but the SoC clock
+generator also runs it at 1050 to 1200 MHz in 50 MHz steps. Let a board
+keep another clock in a flash partition, and apply it while the timers
+are set up, before anything depends on the CPU clock:
+
+ - the setting is "CLKS", the clock select and its complement, at the
+   start of the partition that the "realtek,setting" phandle of a
+   "realtek,rtl8197f-cpu-clock" node points to; it is read through the
+   SPIC FIFO, as the flash driver is not probed yet
+ - holding the key of "realtek,failsafe-key" keeps the boot clock; the
+   pins of its keys node are muxed for this first
+ - the switch is the one of the boot code: the PLL gets the VCO band of
+   the new range, the strap register the new clock select, and the CPU
+   waits until the clock generator raises its wake-up interrupt
+
+Only clocks above the stock one are applied. The strap register then
+gives the kernel the new clock.
+
+Signed-off-by: Roman Rikhter <teledurak@gmail.com>
+--- a/arch/mips/generic/board-realtek.c
++++ b/arch/mips/generic/board-realtek.c
+@@ -5,7 +5,9 @@
+ 
+ #include <linux/errno.h>
+ #include <linux/libfdt.h>
++#include <linux/of_address.h>
+ #include <linux/printk.h>
++#include <linux/string.h>
+ #include <linux/types.h>
+ 
+ #include <asm/fw/fw.h>
+@@ -33,7 +35,20 @@
+ #define RTL931X_DRAM_CONFIG		0x14304c
+ 
+ #define RTL8197F_REVR			0x0000
++#define RTL8197F_SYS_INT_STATUS		0x0004
+ #define RTL8197F_HW_STRAP		0x0008
++#define RTL8197F_PLL1			0x0024
++#define RTL8197F_GIMR			0x3000
++#define RTL8197F_IRR3			0x3014
++#define RTL8197F_SPIC			0x143000
++#define RTL8197F_SPIC_CTRLR0		(RTL8197F_SPIC + 0x000)
++#define RTL8197F_SPIC_CTRLR1		(RTL8197F_SPIC + 0x004)
++#define RTL8197F_SPIC_SSIENR		(RTL8197F_SPIC + 0x008)
++#define RTL8197F_SPIC_SER		(RTL8197F_SPIC + 0x010)
++#define RTL8197F_SPIC_SR		(RTL8197F_SPIC + 0x028)
++#define RTL8197F_SPIC_DR		(RTL8197F_SPIC + 0x060)
++#define RTL8197F_SPIC_ADDR_LENGTH	(RTL8197F_SPIC + 0x118)
++#define RTL8197F_SPIC_AUTO_LENGTH	(RTL8197F_SPIC + 0x11c)
+ #define RTL8197F_BOND_OPTION		0x000c
+ #define RTL8197F_GIMR2			0x3020
+ #define RTL8197F_IRR5			0x302c
+@@ -76,6 +91,203 @@ static u32 __init rtl8197f_cpu_freq(void
+ 	return (mhz >> ((strap >> 19) & 0x3)) * 1000000;
+ }
+ 
++/*
++ * Read from the SPI NOR flash as the SPIC driver does, which is not
++ * probed yet: command and address go into the FIFO, and the controller
++ * reads @len (up to 64, a multiple of 4) bytes on its own.
++ */
++static int __init rtl8197f_flash_read(u32 addr, u8 *buf, unsigned int len)
++{
++	unsigned int i;
++	u32 sr = 0, val;
++
++	soc_w32(0, RTL8197F_SPIC_SSIENR);
++	val = soc_r32(RTL8197F_SPIC_CTRLR0) & ~(GENMASK(19, 16) | GENMASK(9, 8));
++	soc_w32(val | (3 << 8), RTL8197F_SPIC_CTRLR0);
++	soc_w32(3, RTL8197F_SPIC_ADDR_LENGTH);
++	soc_w32(soc_r32(RTL8197F_SPIC_AUTO_LENGTH) & ~GENMASK(15, 0),
++		RTL8197F_SPIC_AUTO_LENGTH);
++	soc_w32(len, RTL8197F_SPIC_CTRLR1);
++	soc_w32(BIT(0), RTL8197F_SPIC_SER);
++
++	__raw_writeb(0x03, RTL_SOC_BASE + RTL8197F_SPIC_DR);
++	__raw_writeb(addr >> 16, RTL_SOC_BASE + RTL8197F_SPIC_DR);
++	__raw_writeb(addr >> 8, RTL_SOC_BASE + RTL8197F_SPIC_DR);
++	__raw_writeb(addr, RTL_SOC_BASE + RTL8197F_SPIC_DR);
++	soc_w32(1, RTL8197F_SPIC_SSIENR);
++
++	for (i = 0; i < 1000000; i++) {
++		sr = soc_r32(RTL8197F_SPIC_SR);
++		if ((sr & BIT(5)) || !(sr & BIT(0)))
++			break;
++	}
++
++	if (sr & (BIT(5) | BIT(0))) {
++		soc_w32(0, RTL8197F_SPIC_SSIENR);
++		return -EIO;
++	}
++
++	for (i = 0; i < len; i += 4) {
++		val = soc_r32(RTL8197F_SPIC_DR);
++		memcpy(buf + i, &val, 4);
++	}
++	soc_w32(0, RTL8197F_SPIC_SSIENR);
++
++	return 0;
++}
++
++static void __iomem * __init rtl8197f_node_base(struct device_node *np)
++{
++	struct resource res;
++
++	if (of_address_to_resource(np, 0, &res))
++		return NULL;
++
++	return (void __iomem *)CKSEG1ADDR(res.start);
++}
++
++/*
++ * Whether the failsafe key is held: returns 1 if so, 0 if not, and an
++ * error if it cannot be read. The pins of its keys node are muxed first,
++ * as the pin controller has not run yet.
++ */
++static int __init rtl8197f_failsafe_held(struct device_node *np)
++{
++	struct device_node *key, *keys, *grp, *mux;
++	struct of_phandle_args args;
++	void __iomem *base;
++	u32 bits[3], mask;
++	int i, ret, held;
++
++	key = of_parse_phandle(np, "realtek,failsafe-key", 0);
++	if (!key)
++		return -ENOENT;
++
++	keys = of_get_parent(key);
++	for (i = 0; keys && (grp = of_parse_phandle(keys, "pinctrl-0", i)); i++) {
++		mux = of_get_parent(grp);
++		base = mux ? rtl8197f_node_base(mux) : NULL;
++		if (base && !of_property_read_u32_array(grp, "pinctrl-single,bits",
++							 bits, 3))
++			__raw_writel((__raw_readl(base + bits[0]) & ~bits[2]) | bits[1],
++				     base + bits[0]);
++		of_node_put(mux);
++		of_node_put(grp);
++	}
++	of_node_put(keys);
++
++	ret = of_parse_phandle_with_args(key, "gpios", "#gpio-cells", 0, &args);
++	of_node_put(key);
++	if (ret)
++		return ret;
++
++	base = rtl8197f_node_base(args.np);
++	of_node_put(args.np);
++	if (!base || args.args_count < 2 || args.args[0] > 31)
++		return -EINVAL;
++
++	/* Otto GPIO: CNR 0x0 selects the peripheral, DIR 0x8 the output */
++	mask = BIT(args.args[0]);
++	__raw_writel(__raw_readl(base) & ~mask, base);
++	__raw_writel(__raw_readl(base + 0x8) & ~mask, base + 0x8);
++
++	held = 0;
++	for (i = 0; i < 8; i++)
++		held += !(__raw_readl(base + 0xc) & mask) == !!(args.args[1] & 1);
++
++	return held == 8;
++}
++
++/*
++ * Switch the CPU clock as the boot code does: the clock changes while the
++ * CPU waits, and the wake-up interrupt (27) ends the wait. The PLL needs
++ * the VCO band of the new range first.
++ */
++static void __init rtl8197f_switch_cpu_clock(unsigned int sel)
++{
++	u32 strap, gimr, irr3, status;
++
++	soc_w32((soc_r32(RTL8197F_PLL1) & ~GENMASK(7, 6)) | ((sel >= 14 ? 3 : 2) << 6),
++		RTL8197F_PLL1);
++
++	gimr = soc_r32(RTL8197F_GIMR);
++	irr3 = soc_r32(RTL8197F_IRR3);
++	status = read_c0_status();
++
++	soc_w32(BIT(1), RTL8197F_SYS_INT_STATUS);
++	soc_w32((irr3 & ~GENMASK(15, 12)) | (2 << 12), RTL8197F_IRR3);
++	soc_w32(BIT(27), RTL8197F_GIMR);
++	/* Interrupts stay off: the 24K leaves WAIT on any unmasked line */
++	write_c0_status((status & ~(ST0_IE | ST0_IM)) | STATUSF_IP2);
++
++	strap = soc_r32(RTL8197F_HW_STRAP) & ~(GENMASK(20, 19) | GENMASK(18, 15));
++	soc_w32(strap | (sel << 15), RTL8197F_HW_STRAP);
++
++	__asm__ __volatile__(
++		"	.set	push		\n"
++		"	.set	mips32r2	\n"
++		"	ehb			\n"
++		"	nop; nop; nop; nop	\n"
++		"	wait			\n"
++		"	nop; nop; nop; nop	\n"
++		"	.set	pop		\n");
++
++	soc_w32(BIT(1), RTL8197F_SYS_INT_STATUS);
++	soc_w32(gimr, RTL8197F_GIMR);
++	soc_w32(irr3, RTL8197F_IRR3);
++	write_c0_status(status);
++}
++
++/*
++ * A board may keep a CPU clock above the stock 1000 MHz in a flash
++ * partition, as "CLKS", the clock select (450 + 50 * sel MHz) and its
++ * complement. Apply it before the timers are set up, unless the failsafe
++ * key is held.
++ */
++static void __init rtl8197f_set_cpu_clock(void)
++{
++	struct device_node *np, *part = NULL;
++	unsigned int sel;
++	u32 offset;
++	u8 rec[8];
++	int held;
++
++	np = of_find_compatible_node(NULL, NULL, "realtek,rtl8197f-cpu-clock");
++	if (!np)
++		return;
++
++	part = of_parse_phandle(np, "realtek,setting", 0);
++	if (!part || of_property_read_u32_index(part, "reg", 0, &offset))
++		goto out;
++
++	if (rtl8197f_flash_read(offset, rec, sizeof(rec))) {
++		pr_err("CPU clock: cannot read the setting\n");
++		goto out;
++	}
++
++	if (memcmp(rec, "CLKS", 4) || (u8)(rec[4] ^ rec[5]) != 0xff)
++		goto out;
++
++	sel = rec[4];
++	if (sel < 12 || sel > 15 ||
++	    sel == ((soc_r32(RTL8197F_HW_STRAP) >> 15) & 0xf))
++		goto out;
++
++	held = rtl8197f_failsafe_held(np);
++	if (held) {
++		pr_warn("CPU clock: %s, keeping the boot clock\n",
++			held > 0 ? "failsafe key held" : "no failsafe key");
++		goto out;
++	}
++
++	rtl8197f_switch_cpu_clock(sel);
++	pr_info("CPU clock: set to %u MHz\n", 450 + 50 * sel);
++
++out:
++	of_node_put(part);
++	of_node_put(np);
++}
++
+ static unsigned int __init realtek_measure_hpt_freq(void)
+ {
+ 	struct device_node *np;
+@@ -94,6 +306,7 @@ static unsigned int __init realtek_measu
+ 
+ 	/* The boot code may have set another CPU clock than the DT one */
+ 	if (soc_info.family == RTL8197F_FAMILY_ID) {
++		rtl8197f_set_cpu_clock();
+ 		freq = rtl8197f_cpu_freq();
+ 		pr_info("CPU frequency from the strap register: %uMHz\n",
+ 			freq / 1000000);
