@@ -167,6 +167,13 @@
 	status = "okay";
 };
 
+&wifi {
+	nvmem-cells = <&macaddr_cfg_7 3>;
+	nvmem-cell-names = "mac-address";
+
+	status = "okay";
+};
+
 &pinmux {
 	/* PIN_MUX_SEL17[27:24]: E2 (WPS button) as GPIO */
 	pinmux_gpio_e2: gpio-e2 {
