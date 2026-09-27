@@ -175,6 +175,21 @@
 			status = "disabled";
 		};
 
+		/*
+		 * 802.11n 2.4 GHz WLAN MAC ("RTL8197G"), with the RF trims in
+		 * the shadow registers of the SoC efuse
+		 */
+		wifi: wifi@640000 {
+			compatible = "realtek,rtl8197f-wifi";
+			reg = <0x640000 0x40000>, <0x780 0x80>;
+			reg-names = "mmio", "efuse";
+			realtek,sysctl = <&sysctl>;
+			interrupt-parent = <&intc>;
+			interrupts = <29 4>;
+
+			status = "disabled";
+		};
+
 		pcie: pcie@b00000 {
 			compatible = "realtek,rtl8197f-pcie";
 			reg = <0xb00000 0x1000>, <0xb0100c 0x4>, <0xb10000 0x1000>;
