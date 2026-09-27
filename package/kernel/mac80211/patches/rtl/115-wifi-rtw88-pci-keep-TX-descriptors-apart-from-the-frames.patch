@@ -1,0 +1,301 @@
+From: Roman Rikhter <teledurak@gmail.com>
+Subject: [PATCH] wifi: rtw88: pci: keep the TX descriptors of a SoC MAC apart
+ from the frames
+
+The PCI bus puts the TX descriptor of a frame in front of it, in the
+headroom of the skb, and asks mac80211 for that much extra headroom (48
+bytes). Frames forwarded from an Ethernet driver rarely have it: they
+come with NET_SKB_PAD + NET_IP_ALIGN, and after the 802.11 header, the
+CCMP header and the LLC header the 48 bytes do not fit anymore, so
+mac80211 reallocates and copies every such frame. On the RTL8197F SoC,
+sending a TCP stream from the LAN to a phone at 88 Mbit/s, this copy
+takes 8 % of the CPU.
+
+The buffer descriptor of a frame takes the TX descriptor as a segment of
+its own, so it need not be in the skb. For a WLAN MAC in a SoC, give
+each TX ring an array of descriptor slots, one per ring entry, fill the
+slot of the entry and point the first segment at it. The rings of the
+reserved pages and of H2C commands keep the descriptors in the skb, as
+the driver builds those frames itself. No extra TX headroom is needed
+then; rtw_tx_fill_tx_desc() now takes the descriptor instead of the skb.
+
+With the same stream the share of the CPU spent in softirq drops from
+41-43 % to 31 %, and the copy no longer shows up in a profile.
+
+Signed-off-by: Roman Rikhter <teledurak@gmail.com>
+---
+diff --git drivers/net/wireless/realtek/rtw88/fw.c drivers/net/wireless/realtek/rtw88/fw.c
+index 0e54252..298dd70 100644
+--- a/drivers/net/wireless/realtek/rtw88/fw.c
++++ b/drivers/net/wireless/realtek/rtw88/fw.c
+@@ -1314,7 +1314,7 @@ static void rtw_fill_rsvd_page_desc(struct rtw_dev *rtwdev, struct sk_buff *skb,
+ 	rtw_tx_rsvd_page_pkt_info_update(rtwdev, &pkt_info, skb, type);
+ 	pkt_desc = skb_push(skb, chip->tx_pkt_desc_sz);
+ 	memset(pkt_desc, 0, chip->tx_pkt_desc_sz);
+-	rtw_tx_fill_tx_desc(rtwdev, &pkt_info, skb);
++	rtw_tx_fill_tx_desc(rtwdev, &pkt_info, pkt_desc);
+ }
+ 
+ static inline u8 rtw_len_to_page(unsigned int len, u16 page_size)
+diff --git drivers/net/wireless/realtek/rtw88/main.c drivers/net/wireless/realtek/rtw88/main.c
+index 29523b6..b504fe7 100644
+--- a/drivers/net/wireless/realtek/rtw88/main.c
++++ b/drivers/net/wireless/realtek/rtw88/main.c
+@@ -2271,7 +2271,8 @@ int rtw_register_hw(struct rtw_dev *rtwdev, struct ieee80211_hw *hw)
+ 	int max_tx_headroom = 0;
+ 	int ret;
+ 
+-	max_tx_headroom = rtwdev->chip->tx_pkt_desc_sz;
++	if (!rtwdev->hci.tx_desc_apart)
++		max_tx_headroom = rtwdev->chip->tx_pkt_desc_sz;
+ 
+ 	if (rtw_hci_type(rtwdev) == RTW_HCI_TYPE_SDIO)
+ 		max_tx_headroom += RTW_SDIO_DATA_PTR_ALIGN;
+diff --git drivers/net/wireless/realtek/rtw88/main.h drivers/net/wireless/realtek/rtw88/main.h
+index 94dedeb..20dae48 100644
+--- a/drivers/net/wireless/realtek/rtw88/main.h
++++ b/drivers/net/wireless/realtek/rtw88/main.h
+@@ -71,6 +71,8 @@ struct rtw_hci {
+ 
+ 	/* RX buffers too small for HT A-MSDUs of 7935 bytes */
+ 	bool rx_amsdu_3839;
++	/* TX descriptors sit apart from the frames: no TX headroom */
++	bool tx_desc_apart;
+ };
+ 
+ #define IS_CH_5G_BAND_1(channel) ((channel) >= 36 && (channel <= 48))
+diff --git drivers/net/wireless/realtek/rtw88/pci.c drivers/net/wireless/realtek/rtw88/pci.c
+index e758ad3..9ef910f 100644
+--- a/drivers/net/wireless/realtek/rtw88/pci.c
++++ b/drivers/net/wireless/realtek/rtw88/pci.c
+@@ -119,6 +119,13 @@ static void rtw_pci_free_tx_ring(struct rtw_dev *rtwdev,
+ 
+ 	rtw_pci_free_tx_ring_skbs(rtwdev, tx_ring);
+ 
++	if (tx_ring->pkt_desc) {
++		dma_unmap_single(rtwdev->dev, tx_ring->pkt_desc_dma,
++				 len * tx_ring->pkt_desc_slot, DMA_TO_DEVICE);
++		kfree(tx_ring->pkt_desc);
++		tx_ring->pkt_desc = NULL;
++	}
++
+ 	/* free the ring itself */
+ 	dma_free_coherent(rtwdev->dev, ring_sz, head, tx_ring->r.dma);
+ 	tx_ring->r.head = NULL;
+@@ -191,6 +198,25 @@ static int rtw_pci_init_tx_ring(struct rtw_dev *rtwdev,
+ 		return -ENOMEM;
+ 	}
+ 
++	if (rtwdev->hci.tx_desc_apart) {
++		u32 slot = ALIGN(rtwdev->chip->tx_pkt_desc_sz,
++				 dma_get_cache_alignment());
++
++		tx_ring->pkt_desc = kzalloc(len * slot, GFP_KERNEL);
++		if (!tx_ring->pkt_desc)
++			goto err_free_ring;
++		tx_ring->pkt_desc_dma = dma_map_single(rtwdev->dev,
++						       tx_ring->pkt_desc,
++						       len * slot,
++						       DMA_TO_DEVICE);
++		if (dma_mapping_error(rtwdev->dev, tx_ring->pkt_desc_dma)) {
++			kfree(tx_ring->pkt_desc);
++			tx_ring->pkt_desc = NULL;
++			goto err_free_ring;
++		}
++		tx_ring->pkt_desc_slot = slot;
++	}
++
+ 	skb_queue_head_init(&tx_ring->queue);
+ 	tx_ring->r.head = head;
+ 	tx_ring->r.dma = dma;
+@@ -200,6 +226,11 @@ static int rtw_pci_init_tx_ring(struct rtw_dev *rtwdev,
+ 	tx_ring->r.rp = 0;
+ 
+ 	return 0;
++
++err_free_ring:
++	rtw_err(rtwdev, "failed to allocate tx descriptors\n");
++	dma_free_coherent(rtwdev->dev, ring_sz, head, dma);
++	return -ENOMEM;
+ }
+ 
+ /* A WLAN MAC in a SoC passes the payload of received data frames up in its
+@@ -852,6 +883,16 @@ static void rtw_pci_tx_kick_off(struct rtw_dev *rtwdev)
+ 			rtw_pci_tx_kick_off_queue(rtwdev, queue);
+ }
+ 
++/* the frames of the beacon (reserved page) and H2C queues carry their
++ * descriptors, as they are written by the driver itself
++ */
++static bool rtw_pci_tx_desc_apart(struct rtw_pci_tx_ring *ring,
++				  enum rtw_tx_queue_type queue)
++{
++	return ring->pkt_desc && queue != RTW_TX_QUEUE_BCN &&
++	       queue != RTW_TX_QUEUE_H2C;
++}
++
+ static int rtw_pci_tx_write_data(struct rtw_dev *rtwdev,
+ 				 struct rtw_tx_pkt_info *pkt_info,
+ 				 struct sk_buff *skb,
+@@ -861,13 +902,14 @@ static int rtw_pci_tx_write_data(struct rtw_dev *rtwdev,
+ 	const struct rtw_chip_info *chip = rtwdev->chip;
+ 	struct rtw_pci_tx_ring *ring;
+ 	struct rtw_pci_tx_data *tx_data;
+-	dma_addr_t dma;
++	dma_addr_t dma, desc_dma, data_dma;
+ 	u32 tx_pkt_desc_sz = chip->tx_pkt_desc_sz;
+ 	u32 tx_buf_desc_sz = chip->tx_buf_desc_sz;
+ 	u32 size;
+ 	u32 psb_len;
+ 	u8 *pkt_desc;
+ 	struct rtw_pci_tx_buffer_desc *buf_desc;
++	bool apart;
+ 
+ 	ring = &rtwpci->tx_rings[queue];
+ 
+@@ -878,27 +920,42 @@ static int rtw_pci_tx_write_data(struct rtw_dev *rtwdev,
+ 	else if (!avail_desc(ring->r.wp, ring->r.rp, ring->r.len))
+ 		return -ENOSPC;
+ 
+-	pkt_desc = skb_push(skb, chip->tx_pkt_desc_sz);
++	apart = rtw_pci_tx_desc_apart(ring, queue);
++	if (apart)
++		pkt_desc = ring->pkt_desc + ring->r.wp * ring->pkt_desc_slot;
++	else
++		pkt_desc = skb_push(skb, chip->tx_pkt_desc_sz);
+ 	memset(pkt_desc, 0, tx_pkt_desc_sz);
+ 	pkt_info->qsel = rtw_pci_get_tx_qsel(skb, queue);
+-	rtw_tx_fill_tx_desc(rtwdev, pkt_info, skb);
++	rtw_tx_fill_tx_desc(rtwdev, pkt_info, pkt_desc);
+ 	dma = dma_map_single(rtwdev->dev, skb->data, skb->len,
+ 			     DMA_TO_DEVICE);
+ 	if (dma_mapping_error(rtwdev->dev, dma))
+ 		return -EBUSY;
+ 
++	if (apart) {
++		desc_dma = ring->pkt_desc_dma +
++			   ring->r.wp * ring->pkt_desc_slot;
++		dma_sync_single_for_device(rtwdev->dev, desc_dma,
++					   tx_pkt_desc_sz, DMA_TO_DEVICE);
++		data_dma = dma;
++	} else {
++		desc_dma = dma;
++		data_dma = dma + tx_pkt_desc_sz;
++	}
++
+ 	/* after this we got dma mapped, there is no way back */
+ 	buf_desc = get_tx_buffer_desc(ring, tx_buf_desc_sz);
+ 	memset(buf_desc, 0, tx_buf_desc_sz);
+-	psb_len = (skb->len - 1) / 128 + 1;
++	psb_len = (tx_pkt_desc_sz + size - 1) / 128 + 1;
+ 	if (queue == RTW_TX_QUEUE_BCN)
+ 		psb_len |= 1 << RTK_PCI_TXBD_OWN_OFFSET;
+ 
+ 	buf_desc[0].psb_len = cpu_to_le16(psb_len);
+ 	buf_desc[0].buf_size = cpu_to_le16(tx_pkt_desc_sz);
+-	buf_desc[0].dma = cpu_to_le32(dma);
++	buf_desc[0].dma = cpu_to_le32(desc_dma);
+ 	buf_desc[1].buf_size = cpu_to_le16(size);
+-	buf_desc[1].dma = cpu_to_le32(dma + tx_pkt_desc_sz);
++	buf_desc[1].dma = cpu_to_le32(data_dma);
+ 
+ 	tx_data = rtw_pci_get_tx_data(skb);
+ 	tx_data->dma = dma;
+@@ -1045,7 +1102,8 @@ static void rtw_pci_tx_isr(struct rtw_dev *rtwdev, struct rtw_pci *rtwpci,
+ 		if (++rp_idx >= ring->r.len)
+ 			rp_idx = 0;
+ 
+-		skb_pull(skb, rtwdev->chip->tx_pkt_desc_sz);
++		if (!rtw_pci_tx_desc_apart(ring, hw_queue))
++			skb_pull(skb, rtwdev->chip->tx_pkt_desc_sz);
+ 
+ 		info = IEEE80211_SKB_CB(skb);
+ 
+@@ -2141,6 +2199,7 @@ int rtw_pci_soc_probe(struct platform_device *pdev,
+ 	rtwdev->hci.ops = &rtw_pci_soc_ops;
+ 	rtwdev->hci.type = RTW_HCI_TYPE_PCIE;
+ 	rtwdev->hci.rx_amsdu_3839 = true;
++	rtwdev->hci.tx_desc_apart = true;
+ 
+ 	rtwpci = (struct rtw_pci *)rtwdev->priv;
+ 	atomic_set(&rtwpci->link_usage, 1);
+diff --git drivers/net/wireless/realtek/rtw88/pci.h drivers/net/wireless/realtek/rtw88/pci.h
+index a6758a7..503e246 100644
+--- a/drivers/net/wireless/realtek/rtw88/pci.h
++++ b/drivers/net/wireless/realtek/rtw88/pci.h
+@@ -198,6 +198,11 @@ struct rtw_pci_tx_ring {
+ 	struct rtw_pci_ring r;
+ 	struct sk_buff_head queue;
+ 	bool queue_stopped;
++
++	/* TX descriptors apart from the frames, one slot per ring entry */
++	u8 *pkt_desc;
++	dma_addr_t pkt_desc_dma;
++	u32 pkt_desc_slot;
+ };
+ 
+ struct rtw_pci_rx_buffer_desc {
+diff --git drivers/net/wireless/realtek/rtw88/sdio.c drivers/net/wireless/realtek/rtw88/sdio.c
+index 5b40d74..d198e8d 100644
+--- a/drivers/net/wireless/realtek/rtw88/sdio.c
++++ b/drivers/net/wireless/realtek/rtw88/sdio.c
+@@ -878,7 +878,7 @@ static void rtw_sdio_tx_skb_prepare(struct rtw_dev *rtwdev,
+ 
+ 	pkt_info->qsel = rtw_sdio_get_tx_qsel(rtwdev, skb, queue);
+ 
+-	rtw_tx_fill_tx_desc(rtwdev, pkt_info, skb);
++	rtw_tx_fill_tx_desc(rtwdev, pkt_info, pkt_desc);
+ 	rtw_tx_fill_txdesc_checksum(rtwdev, pkt_info, pkt_desc);
+ }
+ 
+diff --git drivers/net/wireless/realtek/rtw88/tx.c drivers/net/wireless/realtek/rtw88/tx.c
+index 9e75044..c864d97 100644
+--- a/drivers/net/wireless/realtek/rtw88/tx.c
++++ b/drivers/net/wireless/realtek/rtw88/tx.c
+@@ -33,9 +33,9 @@ void rtw_tx_stats(struct rtw_dev *rtwdev, struct ieee80211_vif *vif,
+ }
+ 
+ void rtw_tx_fill_tx_desc(struct rtw_dev *rtwdev,
+-			 struct rtw_tx_pkt_info *pkt_info, struct sk_buff *skb)
++			 struct rtw_tx_pkt_info *pkt_info, u8 *txdesc)
+ {
+-	struct rtw_tx_desc *tx_desc = (struct rtw_tx_desc *)skb->data;
++	struct rtw_tx_desc *tx_desc = (struct rtw_tx_desc *)txdesc;
+ 	bool more_data = false;
+ 
+ 	if (pkt_info->qsel == TX_DESC_QSEL_HIGH)
+diff --git drivers/net/wireless/realtek/rtw88/tx.h drivers/net/wireless/realtek/rtw88/tx.h
+index 0603408..8f0fc0d 100644
+--- a/drivers/net/wireless/realtek/rtw88/tx.h
++++ b/drivers/net/wireless/realtek/rtw88/tx.h
+@@ -97,7 +97,7 @@ void rtw_tx_pkt_info_update(struct rtw_dev *rtwdev,
+ 			    struct ieee80211_sta *sta,
+ 			    struct sk_buff *skb);
+ void rtw_tx_fill_tx_desc(struct rtw_dev *rtwdev,
+-			 struct rtw_tx_pkt_info *pkt_info, struct sk_buff *skb);
++			 struct rtw_tx_pkt_info *pkt_info, u8 *txdesc);
+ void rtw_tx_report_enqueue(struct rtw_dev *rtwdev, struct sk_buff *skb, u8 sn);
+ 
+ /* the 8197G firmware sends no TX reports, frames count as acked */
+diff --git drivers/net/wireless/realtek/rtw88/usb.c drivers/net/wireless/realtek/rtw88/usb.c
+index 64e1c34..64d8d54 100644
+--- a/drivers/net/wireless/realtek/rtw88/usb.c
++++ b/drivers/net/wireless/realtek/rtw88/usb.c
+@@ -520,7 +520,7 @@ static int rtw_usb_write_data(struct rtw_dev *rtwdev,
+ 	skb_put_data(skb, buf, size);
+ 	skb_push(skb, chip->tx_pkt_desc_sz);
+ 	memset(skb->data, 0, chip->tx_pkt_desc_sz);
+-	rtw_tx_fill_tx_desc(rtwdev, pkt_info, skb);
++	rtw_tx_fill_tx_desc(rtwdev, pkt_info, skb->data);
+ 	rtw_tx_fill_txdesc_checksum(rtwdev, pkt_info, skb->data);
+ 
+ 	ret = rtw_usb_write_port(rtwdev, qsel, skb,
+@@ -590,7 +590,7 @@ static int rtw_usb_tx_write(struct rtw_dev *rtwdev,
+ 	pkt_desc = skb_push(skb, chip->tx_pkt_desc_sz);
+ 	memset(pkt_desc, 0, chip->tx_pkt_desc_sz);
+ 	ep = qsel_to_ep(rtwusb, pkt_info->qsel);
+-	rtw_tx_fill_tx_desc(rtwdev, pkt_info, skb);
++	rtw_tx_fill_tx_desc(rtwdev, pkt_info, skb->data);
+ 	rtw_tx_fill_txdesc_checksum(rtwdev, pkt_info, skb->data);
+ 	tx_data = rtw_usb_get_tx_data(skb);
+ 	tx_data->sn = pkt_info->sn;
