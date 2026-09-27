@@ -1,0 +1,50 @@
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+"Language: ru\n"
+"Plural-Forms: nplurals=3; plural=n%10==1 && n%100!=11 ? 0 : n%10>=2 && "
+"n%10<=4 && (n%100<10 || n%100>=20) ? 1 : 2;\n"
+
+msgid "%s MHz"
+msgstr "%s МГц"
+
+msgid "%s MHz (overclock)"
+msgstr "%s МГц (разгон)"
+
+msgid "%s MHz (stock)"
+msgstr "%s МГц (штатная)"
+
+msgid "CPU clock"
+msgstr "Частота процессора"
+
+msgid "Clock"
+msgstr "Частота"
+
+msgid "Current clock"
+msgstr "Текущая частота"
+
+msgid "Grant access to the CPU clock setting"
+msgstr "Предоставить доступ к настройке частоты процессора"
+
+msgid ""
+"If the router does not start with the chosen clock, hold the WPS button "
+"while powering it on: it then starts at 1000 MHz, and the overclock is "
+"turned off."
+msgstr ""
+"Если роутер не запускается на выбранной частоте, включите его с зажатой "
+"кнопкой WPS: он запустится на 1000 МГц, и разгон будет отключён."
+
+msgid ""
+"The CPU is rated for 1000 MHz. Higher clocks overclock it: the router may "
+"become unstable, and how far it goes differs from unit to unit. A new clock "
+"takes effect at the next boot."
+msgstr ""
+"Процессор рассчитан на 1000 МГц. Более высокая частота — это разгон: роутер "
+"может работать нестабильно, а предел у каждого экземпляра свой. Новая "
+"частота применяется при следующей загрузке."
+
+msgid "overclock turned off with the WPS button"
+msgstr "разгон отключён кнопкой WPS"
+
+msgid "unknown"
+msgstr "неизвестна"

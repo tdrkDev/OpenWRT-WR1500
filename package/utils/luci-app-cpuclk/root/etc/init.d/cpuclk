@@ -1,0 +1,79 @@
+#!/bin/sh /etc/rc.common
+# Store the CPU clock chosen in /etc/config/cpuclk in the cpuclk flash
+# partition, where the kernel reads it at boot, and report the clock the
+# kernel runs at in /var/run/cpuclk.
+
+START=19
+USE_PROCD=1
+
+PART=cpuclk
+STATUS=/var/run/cpuclk
+
+# "CLKS", the clock select (450 + 50 * sel MHz) and its complement;
+# anything else means the stock 1000 MHz
+stored_clock() {
+	local rec sel inv
+
+	rec=$(dd if="$1" bs=6 count=1 2>/dev/null | hexdump -v -e '6/1 "%02x"')
+	case "$rec" in
+	434c4b53????) ;;
+	*) echo 1000; return ;;
+	esac
+
+	sel=$((0x$(echo "$rec" | cut -c9-10)))
+	inv=$((0x$(echo "$rec" | cut -c11-12)))
+	[ $((sel + inv)) -eq 255 ] && echo $((450 + 50 * sel)) || echo 1000
+}
+
+write_clock() {
+	local sel
+
+	if [ "$1" = 1000 ]; then
+		mtd -q erase "$PART" >/dev/null 2>&1
+		return
+	fi
+
+	sel=$((($1 - 450) / 50))
+	printf "CLKS\\$(printf %o $sel)\\$(printf %o $((255 - sel)))" > /tmp/cpuclk.rec
+	mtd -q write /tmp/cpuclk.rec "$PART" >/dev/null 2>&1
+	rm -f /tmp/cpuclk.rec
+}
+
+start_service() {
+	local dev clock running failsafe=0
+
+	dev=$(awk -F: '/"'"$PART"'"/ { print "/dev/" $1 }' /proc/mtd)
+	[ -n "$dev" ] || return 0
+
+	if [ -e "$STATUS" ]; then
+		running=$(sed -n 's/^running=//p' "$STATUS")
+		failsafe=$(sed -n 's/^failsafe=//p' "$STATUS")
+	else
+		# First run since boot
+		running=$(dmesg | sed -n 's/.*CPU frequency from the strap register: \([0-9]*\)MHz.*/\1/p')
+		if dmesg | grep -q "CPU clock: failsafe key held"; then
+			# Holding the WPS button at power-on turns the overclock off
+			failsafe=1
+			uci set cpuclk.main.clock=1000
+			uci commit cpuclk
+		fi
+	fi
+
+	clock=$(uci -q get cpuclk.main.clock)
+	case "$clock" in
+	1050|1100|1150|1200) ;;
+	*) clock=1000 ;;
+	esac
+	[ "$(stored_clock "$dev")" = "$clock" ] || write_clock "$clock"
+
+	printf 'setting=%s\nrunning=%s\nfailsafe=%s\n' \
+		"$clock" "$running" "${failsafe:-0}" > "$STATUS"
+}
+
+reload_service() {
+	start_service
+}
+
+service_triggers() {
+	procd_add_reload_trigger cpuclk
+}

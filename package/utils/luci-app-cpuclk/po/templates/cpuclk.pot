@@ -1,0 +1,41 @@
+msgid ""
+msgstr "Content-Type: text/plain; charset=UTF-8"
+
+msgid "%s MHz"
+msgstr ""
+
+msgid "%s MHz (overclock)"
+msgstr ""
+
+msgid "%s MHz (stock)"
+msgstr ""
+
+msgid "CPU clock"
+msgstr ""
+
+msgid "Clock"
+msgstr ""
+
+msgid "Current clock"
+msgstr ""
+
+msgid "Grant access to the CPU clock setting"
+msgstr ""
+
+msgid ""
+"If the router does not start with the chosen clock, hold the WPS button "
+"while powering it on: it then starts at 1000 MHz, and the overclock is "
+"turned off."
+msgstr ""
+
+msgid ""
+"The CPU is rated for 1000 MHz. Higher clocks overclock it: the router may "
+"become unstable, and how far it goes differs from unit to unit. A new clock "
+"takes effect at the next boot."
+msgstr ""
+
+msgid "overclock turned off with the WPS button"
+msgstr ""
+
+msgid "unknown"
+msgstr ""

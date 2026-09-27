@@ -1,0 +1,15 @@
+{
+	"luci-app-cpuclk": {
+		"description": "Grant access to the CPU clock setting",
+		"read": {
+			"file": {
+				"/var/run/cpuclk": [ "read" ],
+				"/tmp/run/cpuclk": [ "read" ]
+			},
+			"uci": [ "cpuclk" ]
+		},
+		"write": {
+			"uci": [ "cpuclk" ]
+		}
+	}
+}

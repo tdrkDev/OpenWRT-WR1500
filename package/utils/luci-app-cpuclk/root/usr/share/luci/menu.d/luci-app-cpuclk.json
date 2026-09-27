@@ -1,0 +1,14 @@
+{
+	"admin/system/cpuclk": {
+		"title": "CPU clock",
+		"order": 45,
+		"action": {
+			"type": "view",
+			"path": "system/cpuclk"
+		},
+		"depends": {
+			"acl": [ "luci-app-cpuclk" ],
+			"uci": { "cpuclk": true }
+		}
+	}
+}
