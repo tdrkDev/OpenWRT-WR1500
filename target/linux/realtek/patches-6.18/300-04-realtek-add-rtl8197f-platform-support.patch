@@ -16,10 +16,8 @@ Realtek Otto switch SoCs. Add it to the generic Realtek board:
 
 Signed-off-by: Roman Rikhter <teledurak@gmail.com>
 ---
-Index: linux-6.18.52/arch/mips/Kconfig
-===================================================================
---- linux-6.18.52.orig/arch/mips/Kconfig
-+++ linux-6.18.52/arch/mips/Kconfig
+--- a/arch/mips/Kconfig
++++ b/arch/mips/Kconfig
 @@ -1060,6 +1060,18 @@ config FIT_IMAGE_FDT_EPM5
  	  from Mobileye in the FIT kernel image.
  	  This requires u-boot on the platform.
@@ -47,10 +45,8 @@ Index: linux-6.18.52/arch/mips/Kconfig
  	help
  	  Some MIPS machines can be configured for either little or big endian
  	  byte order. These modes require different kernels and a different
-Index: linux-6.18.52/arch/mips/generic/board-realtek.c
-===================================================================
---- linux-6.18.52.orig/arch/mips/generic/board-realtek.c
-+++ linux-6.18.52/arch/mips/generic/board-realtek.c
+--- a/arch/mips/generic/board-realtek.c
++++ b/arch/mips/generic/board-realtek.c
 @@ -10,6 +10,8 @@
  
  #include <asm/fw/fw.h>
@@ -60,11 +56,12 @@ Index: linux-6.18.52/arch/mips/generic/board-realtek.c
  
  #include <mach-rtl-otto.h>
  
-@@ -30,13 +32,22 @@
+@@ -30,13 +32,23 @@
  
  #define RTL931X_DRAM_CONFIG		0x14304c
  
 +#define RTL8197F_REVR			0x0000
++#define RTL8197F_HW_STRAP		0x0008
 +#define RTL8197F_BOND_OPTION		0x000c
 +#define RTL8197F_GIMR2			0x3020
 +#define RTL8197F_IRR5			0x302c
@@ -83,10 +80,43 @@ Index: linux-6.18.52/arch/mips/generic/board-realtek.c
  	void (*read_details)(u32 model);
  	void (*apply_quirks)(void);
  	void (*get_memory)(void);
-@@ -61,6 +72,17 @@ static unsigned int __init realtek_measu
+@@ -45,6 +57,25 @@ struct realtek_soc_data {
+ 
+ struct rtl83xx_soc_info soc_info;
+ 
++/*
++ * The boot code sets the CPU clock in the strap register: CK_CPU_FREQ_SEL
++ * (bits 18:15) selects 450 + 50 * sel MHz, CK_CPU_DIV_SEL (bits 20:19)
++ * divides that by 2^div, and bit 14 runs the CPU from the 200 MHz clock
++ * instead.
++ */
++static u32 __init rtl8197f_cpu_freq(void)
++{
++	u32 strap = soc_r32(RTL8197F_HW_STRAP);
++	u32 mhz;
++
++	if (strap & BIT(14))
++		mhz = 200;
++	else
++		mhz = 450 + 50 * ((strap >> 15) & 0xf);
++
++	return (mhz >> ((strap >> 19) & 0x3)) * 1000000;
++}
++
+ static unsigned int __init realtek_measure_hpt_freq(void)
+ {
+ 	struct device_node *np;
+@@ -61,6 +92,24 @@ static unsigned int __init realtek_measu
  		of_node_put(np);
  	}
  
++	/* The boot code may have set another CPU clock than the DT one */
++	if (soc_info.family == RTL8197F_FAMILY_ID) {
++		freq = rtl8197f_cpu_freq();
++		pr_info("CPU frequency from the strap register: %uMHz\n",
++			freq / 1000000);
++	}
++
 +	/*
 +	 * IntCtl of the RTL8197F claims the timer interrupt at IP2, which is
 +	 * the interrupt controller cascade. The SoC instead routes it through
@@ -101,7 +131,7 @@ Index: linux-6.18.52/arch/mips/generic/board-realtek.c
  	return freq / 2;
  }
  
-@@ -172,6 +194,69 @@ static void __init rtl96xx_read_details(
+@@ -172,6 +221,69 @@ static void __init rtl96xx_read_details(
  	soc_info.revision = model & 0xf;
  }
  
@@ -171,7 +201,7 @@ Index: linux-6.18.52/arch/mips/generic/board-realtek.c
  static void __init realtek_parse_model(u32 model)
  {
  	int val;
-@@ -288,7 +373,10 @@ static void __init realtek_prom_init(con
+@@ -288,7 +400,10 @@ static void __init realtek_prom_init(con
  	if (!cfg)
  		panic("No match_data found!");
  
@@ -183,7 +213,7 @@ Index: linux-6.18.52/arch/mips/generic/board-realtek.c
  
  	soc_info.id = model >> 16 & 0xffff;
  	soc_info.family = cfg->family;
-@@ -298,14 +386,21 @@ static void __init realtek_prom_init(con
+@@ -298,14 +413,21 @@ static void __init realtek_prom_init(con
  		cfg->apply_quirks();
  
  	cfg->read_details(model);
@@ -208,7 +238,7 @@ Index: linux-6.18.52/arch/mips/generic/board-realtek.c
  
  	/*
  	 * fw_arg2 is the pointer to the environment. Some devices (e.g. HP JG924A) hand
-@@ -387,6 +482,15 @@ static __init const void *realtek_fixup_
+@@ -387,6 +509,15 @@ static __init const void *realtek_fixup_
  
  }
  
@@ -224,7 +254,7 @@ Index: linux-6.18.52/arch/mips/generic/board-realtek.c
  static const struct realtek_soc_data rtl838x_soc __initconst = {
  	.model_info_reg = RTL838X_MODEL_NAME_INFO,
  	.family = RTL8380_FAMILY_ID,
-@@ -431,6 +535,7 @@ static const struct realtek_soc_data rtl
+@@ -431,6 +562,7 @@ static const struct realtek_soc_data rtl
  };
  
  static const struct of_device_id realtek_of_match[] __initconst = {
