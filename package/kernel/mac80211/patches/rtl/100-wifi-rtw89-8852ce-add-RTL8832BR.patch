@@ -21,10 +21,89 @@ efuse values; set it up as the vendor driver does on every bandwidth
 change, together with the DFIR type and tracking loop filters for
 20 MHz, instead of the RTL8852C settings.
 
+It is the 20/40/80 MHz product of its die: at 160 MHz it sends but
+receives nothing. Leave 160 MHz out of its capabilities.
+
 Signed-off-by: Roman Rikhter <teledurak@gmail.com>
 ---
+diff --git drivers/net/wireless/realtek/rtw89/core.c drivers/net/wireless/realtek/rtw89/core.c
+index 68dad60..88352bb 100644
+--- a/drivers/net/wireless/realtek/rtw89/core.c
++++ b/drivers/net/wireless/realtek/rtw89/core.c
+@@ -6012,7 +6012,7 @@ static void rtw89_init_vht_cap(struct rtw89_dev *rtwdev,
+ 		cpu_to_le16(867), cpu_to_le16(1733), cpu_to_le16(2600), cpu_to_le16(3467),
+ 	};
+ 	const struct rtw89_chip_info *chip = rtwdev->chip;
+-	const __le16 *highest = chip->support_bandwidths & BIT(NL80211_CHAN_WIDTH_160) ?
++	const __le16 *highest = rtw89_support_bandwidths(rtwdev) & BIT(NL80211_CHAN_WIDTH_160) ?
+ 				highest_bw160 : highest_bw80;
+ 	struct rtw89_hal *hal = &rtwdev->hal;
+ 	u16 tx_mcs_map = 0, rx_mcs_map = 0;
+@@ -6042,7 +6042,7 @@ static void rtw89_init_vht_cap(struct rtw89_dev *rtwdev,
+ 	vht_cap->cap |= IEEE80211_VHT_CAP_MU_BEAMFORMEE_CAPABLE |
+ 			IEEE80211_VHT_CAP_SU_BEAMFORMEE_CAPABLE;
+ 	vht_cap->cap |= sts_cap << IEEE80211_VHT_CAP_BEAMFORMEE_STS_SHIFT;
+-	if (chip->support_bandwidths & BIT(NL80211_CHAN_WIDTH_160))
++	if (rtw89_support_bandwidths(rtwdev) & BIT(NL80211_CHAN_WIDTH_160))
+ 		vht_cap->cap |= IEEE80211_VHT_CAP_SUPP_CHAN_WIDTH_160MHZ |
+ 				IEEE80211_VHT_CAP_SHORT_GI_160;
+ 	vht_cap->vht_mcs.rx_mcs_map = cpu_to_le16(rx_mcs_map);
+@@ -6101,7 +6101,7 @@ static void rtw89_init_he_cap(struct rtw89_dev *rtwdev,
+ 	} else {
+ 		phy_cap_info[0] =
+ 			IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_40MHZ_80MHZ_IN_5G;
+-		if (chip->support_bandwidths & BIT(NL80211_CHAN_WIDTH_160))
++		if (rtw89_support_bandwidths(rtwdev) & BIT(NL80211_CHAN_WIDTH_160))
+ 			phy_cap_info[0] |= IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_160MHZ_IN_5G;
+ 	}
+ 	phy_cap_info[1] = IEEE80211_HE_PHY_CAP1_DEVICE_CLASS_A |
+@@ -6119,7 +6119,7 @@ static void rtw89_init_he_cap(struct rtw89_dev *rtwdev,
+ 		phy_cap_info[3] |= IEEE80211_HE_PHY_CAP3_RX_PARTIAL_BW_SU_IN_20MHZ_MU;
+ 	phy_cap_info[4] = IEEE80211_HE_PHY_CAP4_SU_BEAMFORMEE |
+ 			  IEEE80211_HE_PHY_CAP4_BEAMFORMEE_MAX_STS_UNDER_80MHZ_4;
+-	if (chip->support_bandwidths & BIT(NL80211_CHAN_WIDTH_160))
++	if (rtw89_support_bandwidths(rtwdev) & BIT(NL80211_CHAN_WIDTH_160))
+ 		phy_cap_info[4] |= IEEE80211_HE_PHY_CAP4_BEAMFORMEE_MAX_STS_ABOVE_80MHZ_4;
+ 	phy_cap_info[5] = no_ng16 ? 0 :
+ 			  IEEE80211_HE_PHY_CAP5_NG16_SU_FEEDBACK |
+@@ -6134,7 +6134,7 @@ static void rtw89_init_he_cap(struct rtw89_dev *rtwdev,
+ 	phy_cap_info[8] = IEEE80211_HE_PHY_CAP8_HE_ER_SU_PPDU_4XLTF_AND_08_US_GI |
+ 			  IEEE80211_HE_PHY_CAP8_HE_ER_SU_1XLTF_AND_08_US_GI |
+ 			  IEEE80211_HE_PHY_CAP8_DCM_MAX_RU_996;
+-	if (chip->support_bandwidths & BIT(NL80211_CHAN_WIDTH_160))
++	if (rtw89_support_bandwidths(rtwdev) & BIT(NL80211_CHAN_WIDTH_160))
+ 		phy_cap_info[8] |= IEEE80211_HE_PHY_CAP8_20MHZ_IN_160MHZ_HE_PPDU |
+ 				   IEEE80211_HE_PHY_CAP8_80MHZ_IN_160MHZ_HE_PPDU;
+ 	phy_cap_info[9] = IEEE80211_HE_PHY_CAP9_LONGER_THAN_16_SIGB_OFDM_SYM |
+@@ -6147,7 +6147,7 @@ static void rtw89_init_he_cap(struct rtw89_dev *rtwdev,
+ 		phy_cap_info[9] |= IEEE80211_HE_PHY_CAP9_TX_1024_QAM_LESS_THAN_242_TONE_RU;
+ 	he_cap->he_mcs_nss_supp.rx_mcs_80 = cpu_to_le16(mcs_map);
+ 	he_cap->he_mcs_nss_supp.tx_mcs_80 = cpu_to_le16(mcs_map);
+-	if (chip->support_bandwidths & BIT(NL80211_CHAN_WIDTH_160)) {
++	if (rtw89_support_bandwidths(rtwdev) & BIT(NL80211_CHAN_WIDTH_160)) {
+ 		he_cap->he_mcs_nss_supp.rx_mcs_160 = cpu_to_le16(mcs_map);
+ 		he_cap->he_mcs_nss_supp.tx_mcs_160 = cpu_to_le16(mcs_map);
+ 	}
+@@ -6187,7 +6187,7 @@ static void rtw89_init_eht_cap(struct rtw89_dev *rtwdev,
+ 		support_mcs_12_13 = false;
+ 
+ 	if (band == NL80211_BAND_6GHZ &&
+-	    chip->support_bandwidths & BIT(NL80211_CHAN_WIDTH_320))
++	    rtw89_support_bandwidths(rtwdev) & BIT(NL80211_CHAN_WIDTH_320))
+ 		support_320mhz = true;
+ 
+ 	eht_cap = &iftype_data->eht_cap;
+@@ -7401,7 +7401,7 @@ static int rtw89_core_register_hw(struct rtw89_dev *rtwdev)
+ 	ieee80211_hw_set(hw, WANT_MONITOR_VIF);
+ 	ieee80211_hw_set(hw, CHANCTX_STA_CSA);
+ 
+-	if (chip->support_bandwidths & BIT(NL80211_CHAN_WIDTH_160))
++	if (rtw89_support_bandwidths(rtwdev) & BIT(NL80211_CHAN_WIDTH_160))
+ 		ieee80211_hw_set(hw, SUPPORTS_VHT_EXT_NSS_BW);
+ 
+ 	if (RTW89_CHK_FW_FEATURE(BEACON_FILTER, &rtwdev->fw))
 diff --git drivers/net/wireless/realtek/rtw89/core.h drivers/net/wireless/realtek/rtw89/core.h
-index 5547888..256748e 100644
+index 5547888..712cd40 100644
 --- a/drivers/net/wireless/realtek/rtw89/core.h
 +++ b/drivers/net/wireless/realtek/rtw89/core.h
 @@ -3624,6 +3624,8 @@ struct rtw89_sta_link {
@@ -36,21 +115,32 @@ index 5547888..256748e 100644
  	u8 xtal_cap;
  	u8 addr[ETH_ALEN];
  	u8 rfe_type;
-@@ -4794,6 +4796,7 @@ struct rtw89_chip_info {
+@@ -4794,6 +4796,8 @@ struct rtw89_chip_info {
  
  struct rtw89_chip_variant {
  	bool no_mcs_12_13: 1;
 +	bool rtl8832br: 1;
++	bool no_bw_160: 1;
  	u32 fw_min_ver_code;
  	const struct rtw89_fw_def *fw_def_override;
  	const struct rtw89_qta_def *qta_def_override;
-@@ -8051,6 +8054,11 @@ static inline bool rtw89_is_rtl885xb(struct rtw89_dev *rtwdev)
+@@ -8051,6 +8055,21 @@ static inline bool rtw89_is_rtl885xb(struct rtw89_dev *rtwdev)
  	return false;
  }
  
 +static inline bool rtw89_is_rtl8832br(struct rtw89_dev *rtwdev)
 +{
 +	return rtwdev->variant && rtwdev->variant->rtl8832br;
++}
++
++static inline u16 rtw89_support_bandwidths(struct rtw89_dev *rtwdev)
++{
++	u16 bw = rtwdev->chip->support_bandwidths;
++
++	if (rtwdev->variant && rtwdev->variant->no_bw_160)
++		bw &= ~BIT(NL80211_CHAN_WIDTH_160);
++
++	return bw;
 +}
 +
  static inline u32 rtw89_bytes_to_mbps(u64 bytes, enum rtw89_tfc_interval interval)
@@ -212,7 +302,7 @@ index 086ef77..5904954 100644
  #define R_AX_SYSON_FSM_MON 0x00A0
  #define B_AX_FSM_MON_SEL_MASK GENMASK(26, 24)
 diff --git drivers/net/wireless/realtek/rtw89/rtw8852c.c drivers/net/wireless/realtek/rtw89/rtw8852c.c
-index 8082188..459e786 100644
+index 8082188..d29d8fb 100644
 --- a/drivers/net/wireless/realtek/rtw89/rtw8852c.c
 +++ b/drivers/net/wireless/realtek/rtw89/rtw8852c.c
 @@ -20,6 +20,11 @@
@@ -585,7 +675,7 @@ index 8082188..459e786 100644
  	rtw8852c_edcca_per20_bitmap_sifs(rtwdev, bw, phy_idx);
  }
  
-@@ -3322,7 +3638,19 @@ const struct rtw89_chip_info rtw8852c_chip_info = {
+@@ -3322,7 +3638,20 @@ const struct rtw89_chip_info rtw8852c_chip_info = {
  };
  EXPORT_SYMBOL(rtw8852c_chip_info);
  
@@ -596,6 +686,7 @@ index 8082188..459e786 100644
 +
 +const struct rtw89_chip_variant rtw8832br_variant = {
 +	.rtl8832br = true,
++	.no_bw_160 = true,
 +	.fw_def_override = &rtw8832br_fw_def,
 +};
 +EXPORT_SYMBOL(rtw8832br_variant);

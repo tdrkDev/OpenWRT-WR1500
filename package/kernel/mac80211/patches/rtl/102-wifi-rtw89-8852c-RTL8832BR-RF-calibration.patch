@@ -1468,7 +1468,7 @@ index 0000000..f193f6c
 +
 +#endif
 diff --git drivers/net/wireless/realtek/rtw89/rtw8852c.c drivers/net/wireless/realtek/rtw89/rtw8852c.c
-index 459e786..3a9e01b 100644
+index d29d8fb..f942d81 100644
 --- a/drivers/net/wireless/realtek/rtw89/rtw8852c.c
 +++ b/drivers/net/wireless/realtek/rtw89/rtw8852c.c
 @@ -12,6 +12,7 @@
