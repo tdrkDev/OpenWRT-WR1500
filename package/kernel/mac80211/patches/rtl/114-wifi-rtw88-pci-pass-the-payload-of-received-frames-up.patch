@@ -1,0 +1,223 @@
+From: Roman Rikhter <teledurak@gmail.com>
+Subject: [PATCH] wifi: rtw88: pci: pass the payload of received frames up
+ without copying it
+
+Every received frame is copied out of its RX buffer into a new skb. On
+the WLAN MAC of the RTL8197F SoC (MIPS 24Kc) the frame then also sits
+two bytes off: the MAC writes it 4-byte aligned into the buffer, behind
+the RX descriptor and the PHY status, which leaves the IP header of a
+QoS data frame at 2 mod 4 (the RX shift of the MAC stays 0), and
+mac80211 realigns every such frame with an overlapping memmove, a byte
+loop on MIPS. Moving the buffer by two bytes does not help: the MAC
+takes no buffer address that is not 4-byte aligned. Forwarding a 103
+Mbit/s TCP stream from a phone to the LAN, the copy takes 8 % and the
+realignment 11 % of the CPU.
+
+On the SoC bus, put the RX buffers into pages of their own. A data frame
+of 256 bytes or more goes up without copying its payload: its first 128
+bytes are copied into a small skb, whose data starts NET_IP_ALIGN into
+its buffer, which aligns the IP header, and the rest of the frame stays
+in the RX buffer as a page fragment of that skb. The ring slot gets a
+new buffer. Other frames and reports are still copied whole. The
+Ethernet driver of the SoC sends such skbs as they are (scatter-gather).
+
+With the same stream (107 Mbit/s), the share of the CPU spent in softirq
+drops from 72 % to 63 %; neither the copy nor the realignment shows up
+in a profile anymore.
+
+Signed-off-by: Roman Rikhter <teledurak@gmail.com>
+---
+diff --git drivers/net/wireless/realtek/rtw88/pci.c drivers/net/wireless/realtek/rtw88/pci.c
+index 1459563..e758ad3 100644
+--- a/drivers/net/wireless/realtek/rtw88/pci.c
++++ b/drivers/net/wireless/realtek/rtw88/pci.c
+@@ -202,6 +202,42 @@ static int rtw_pci_init_tx_ring(struct rtw_dev *rtwdev,
+ 	return 0;
+ }
+ 
++/* A WLAN MAC in a SoC passes the payload of received data frames up in its
++ * RX buffers: they sit in pages of their own, and the ring slot gets a new
++ * one. Only the head of such a frame is copied, into a small skb of its own.
++ * Short frames, other frames and reports are copied whole, which is cheaper
++ * than a new buffer.
++ */
++#define RTK_SOC_RX_HEADROOM	NET_SKB_PAD
++#define RTK_SOC_RX_PAGE_ORDER	get_order(RTK_SOC_RX_HEADROOM + \
++					  RTK_SOC_RX_BUF_SIZE + \
++					  SKB_DATA_ALIGN(sizeof(struct skb_shared_info)))
++#define RTK_SOC_RX_COPYBREAK	256
++#define RTK_SOC_RX_HEAD_LEN	128
++
++static struct sk_buff *rtw_pci_alloc_rx_skb(struct rtw_pci *rtwpci, gfp_t gfp)
++{
++	unsigned int order = RTK_SOC_RX_PAGE_ORDER;
++	struct sk_buff *skb;
++	struct page *page;
++
++	if (rtwpci->pdev)
++		return dev_alloc_skb(rtwpci->rx_buf_size);
++
++	page = __dev_alloc_pages(gfp | __GFP_NOWARN, order);
++	if (!page)
++		return NULL;
++
++	skb = build_skb(page_address(page), PAGE_SIZE << order);
++	if (!skb) {
++		__free_pages(page, order);
++		return NULL;
++	}
++	skb_reserve(skb, RTK_SOC_RX_HEADROOM);
++
++	return skb;
++}
++
+ static int rtw_pci_reset_rx_desc(struct rtw_dev *rtwdev, struct sk_buff *skb,
+ 				 struct rtw_pci_rx_ring *rx_ring,
+ 				 u32 idx, u32 desc_sz)
+@@ -267,7 +303,7 @@ static int rtw_pci_init_rx_ring(struct rtw_dev *rtwdev,
+ 	rx_ring->r.head = head;
+ 
+ 	for (i = 0; i < len; i++) {
+-		skb = dev_alloc_skb(buf_sz);
++		skb = rtw_pci_alloc_rx_skb(rtwpci, GFP_KERNEL);
+ 		if (!skb) {
+ 			allocated = i;
+ 			ret = -ENOMEM;
+@@ -1059,6 +1095,72 @@ static int rtw_pci_get_hw_rx_ring_nr(struct rtw_dev *rtwdev,
+ 	return count;
+ }
+ 
++/* put a new buffer into the ring slot of a frame that goes up in its own */
++static int rtw_pci_soc_rx_refill(struct rtw_dev *rtwdev,
++				 struct rtw_pci_rx_ring *ring, u32 idx,
++				 u32 desc_sz)
++{
++	struct rtw_pci *rtwpci = (struct rtw_pci *)rtwdev->priv;
++	struct sk_buff *skb;
++
++	skb = rtw_pci_alloc_rx_skb(rtwpci, GFP_ATOMIC);
++	if (!skb)
++		return -ENOMEM;
++
++	if (rtw_pci_reset_rx_desc(rtwdev, skb, ring, idx, desc_sz)) {
++		dev_kfree_skb_any(skb);
++		return -ENOMEM;
++	}
++	ring->buf[idx] = skb;
++
++	return 0;
++}
++
++/* Pass a data frame up without copying its payload: the head goes into a
++ * small skb, the rest stays in the RX buffer and becomes a page fragment of
++ * that skb. The MAC puts the frame 4-byte aligned into the buffer, which
++ * leaves the IP header of a QoS data frame 2 bytes off, and mac80211 would
++ * realign the whole frame byte by byte; the new skb starts NET_IP_ALIGN into
++ * its buffer, which aligns the copied head instead.
++ */
++static struct sk_buff *rtw_pci_soc_rx_frag(struct rtw_dev *rtwdev,
++					   struct rtw_pci_rx_ring *ring,
++					   u32 idx, u32 desc_sz, u32 offset,
++					   u32 len, int budget)
++{
++	struct rtw_pci *rtwpci = (struct rtw_pci *)rtwdev->priv;
++	struct sk_buff *buf = ring->buf[idx];
++	dma_addr_t dma = *((dma_addr_t *)buf->cb);
++	u32 head_len = min_t(u32, len, RTK_SOC_RX_HEAD_LEN);
++	struct page *page = virt_to_head_page(buf->head);
++	u8 *data = buf->data + offset;
++	struct sk_buff *skb;
++
++	skb = napi_alloc_skb(&rtwpci->napi, head_len);
++	if (!skb)
++		return NULL;
++
++	if (rtw_pci_soc_rx_refill(rtwdev, ring, idx, desc_sz)) {
++		napi_consume_skb(skb, budget);
++		return NULL;
++	}
++
++	/* the CPU has synced the whole buffer already */
++	dma_unmap_single_attrs(rtwdev->dev, dma, rtwpci->rx_buf_size,
++			       DMA_FROM_DEVICE, DMA_ATTR_SKIP_CPU_SYNC);
++	skb_put_data(skb, data, head_len);
++	if (len > head_len) {
++		get_page(page);
++		skb_add_rx_frag(skb, 0, page,
++				data + head_len - (u8 *)page_address(page),
++				len - head_len,
++				PAGE_SIZE << RTK_SOC_RX_PAGE_ORDER);
++	}
++	napi_consume_skb(buf, budget);
++
++	return skb;
++}
++
+ static u32 rtw_pci_rx_napi(struct rtw_dev *rtwdev, struct rtw_pci *rtwpci,
+ 			   u8 hw_queue, u32 limit)
+ {
+@@ -1082,6 +1184,9 @@ static u32 rtw_pci_rx_napi(struct rtw_dev *rtwdev, struct rtw_pci *rtwpci,
+ 	count = min(count, limit);
+ 
+ 	while (count--) {
++		struct ieee80211_hdr *hdr;
++		bool passed = false;
++
+ 		rtw_pci_dma_check(rtwdev, ring, cur_rp);
+ 		skb = ring->buf[cur_rp];
+ 		dma = *((dma_addr_t *)skb->cb);
+@@ -1106,6 +1211,19 @@ static u32 rtw_pci_rx_napi(struct rtw_dev *rtwdev, struct rtw_pci *rtwpci,
+ 				"oversized RX packet: %u\n", new_len);
+ 			goto next_rp;
+ 		}
++		hdr = (struct ieee80211_hdr *)(rx_desc + pkt_offset);
++		if (!rtwpci->pdev && !pkt_stat.is_c2h &&
++		    new_len >= RTK_SOC_RX_COPYBREAK &&
++		    ieee80211_is_data_present(hdr->frame_control)) {
++			new = rtw_pci_soc_rx_frag(rtwdev, ring, cur_rp,
++						  buf_desc_sz, pkt_offset,
++						  pkt_stat.pkt_len, limit);
++			if (new) {
++				passed = true;
++				goto deliver;
++			}
++		}
++
+ 		new = dev_alloc_skb(new_len);
+ 		if (WARN_ONCE(!new, "rx routine starvation\n"))
+ 			goto next_rp;
+@@ -1115,21 +1233,23 @@ static u32 rtw_pci_rx_napi(struct rtw_dev *rtwdev, struct rtw_pci *rtwpci,
+ 
+ 		if (pkt_stat.is_c2h) {
+ 			rtw_fw_c2h_cmd_rx_irqsafe(rtwdev, pkt_offset, new);
+-		} else {
+-			/* remove rx_desc */
+-			skb_pull(new, pkt_offset);
+-
+-			rtw_update_rx_freq_for_invalid(rtwdev, new, &rx_status, &pkt_stat);
+-			rtw_rx_stats(rtwdev, pkt_stat.vif, new);
+-			memcpy(new->cb, &rx_status, sizeof(rx_status));
+-			ieee80211_rx_napi(rtwdev->hw, NULL, new, napi);
+-			rx_done++;
++			goto next_rp;
+ 		}
+ 
++		/* remove rx_desc */
++		skb_pull(new, pkt_offset);
++deliver:
++		rtw_update_rx_freq_for_invalid(rtwdev, new, &rx_status, &pkt_stat);
++		rtw_rx_stats(rtwdev, pkt_stat.vif, new);
++		memcpy(new->cb, &rx_status, sizeof(rx_status));
++		ieee80211_rx_napi(rtwdev->hw, NULL, new, napi);
++		rx_done++;
++
+ next_rp:
+ 		/* new skb delivered to mac80211, re-enable original skb DMA */
+-		rtw_pci_sync_rx_desc_device(rtwdev, dma, ring, cur_rp,
+-					    buf_desc_sz);
++		if (!passed)
++			rtw_pci_sync_rx_desc_device(rtwdev, dma, ring, cur_rp,
++						    buf_desc_sz);
+ 
+ 		/* host read next element in ring */
+ 		if (++cur_rp >= ring->r.len)
