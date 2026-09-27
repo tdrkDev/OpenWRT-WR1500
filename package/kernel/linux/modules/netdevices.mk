@@ -2200,7 +2200,8 @@ define KernelPackage/sfp
 	CONFIG_MDIO_I2C
   FILES:= \
 	$(LINUX_DIR)/drivers/net/phy/sfp.ko \
-	$(LINUX_DIR)/drivers/net/mdio/mdio-i2c.ko
+	$(LINUX_DIR)/drivers/net/mdio/mdio-i2c.ko \
+	$(if $(CONFIG_MDIO_SMBUS),$(LINUX_DIR)/drivers/net/mdio/mdio-smbus.ko)
   AUTOLOAD:=$(call AutoProbe,mdio-i2c sfp)
 endef
 
