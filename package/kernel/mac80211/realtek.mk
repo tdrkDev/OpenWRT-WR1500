@@ -591,7 +591,7 @@ endef
 define KernelPackage/rtw89-8852ce
   $(call KernelPackage/mac80211/Default)
   TITLE:=Realtek RTL8852CE support
-  DEPENDS+= +kmod-rtw89-pci +rtl8852ce-firmware
+  DEPENDS+= +kmod-rtw89-pci +!TARGET_realtek_rtl8197f:rtl8852ce-firmware
   FILES:= \
 	$(PKG_BUILD_DIR)/drivers/net/wireless/realtek/rtw89/rtw89_8852c.ko \
 	$(PKG_BUILD_DIR)/drivers/net/wireless/realtek/rtw89/rtw89_8852ce.ko
