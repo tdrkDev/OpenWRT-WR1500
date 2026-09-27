@@ -1,0 +1,1012 @@
+From: Roman Rikhter <teledurak@gmail.com>
+Subject: [PATCH] wifi: rtw89: 8852c: add radar detection for the RTL8832BR
+
+An AP on a DFS channel needs radar detection. rtw89 has none, so hostapd
+fails to start its channel availability check and the RTL8832BR can't
+use channels 52-64 and 100-144.
+
+The baseband reports every pulse it sees: width, interval to the previous
+pulse and a chirp flag. The MAC collects the reports and sends them to
+the host as RX packets of type 8, in batches of up to 61 pulses or after
+80 ms. Set this up with R_AX_DFS_CFG0 whenever the channel needs DFS; the
+BB report block must be enabled first, which the MAC init leaves off.
+
+Detect radars in software, following the detector of the vendor driver
+for this chip (halbb, gen0 report format): each batch is matched against
+the radar types of the DFS region (FCC, ETSI, or Japan W53/W56), and
+long chirp radars are counted across batches. The tolerances follow the
+traffic load as in the vendor driver. On a match, report the radar to
+mac80211, which stops the CAC or makes hostapd switch channels.
+
+Advertise radar detection for 20, 40 and 80 MHz for the RTL8832BR. A
+debugfs file shows the statistics and can simulate a radar.
+
+Tested on a Cudy WR1500 (country CA): CAC on channels 100 and 36-64
+completes, and a radar near the test site (chirped 92 us pulses in
+groups every 5.3 s, matching FCC type 5) is detected and makes hostapd
+move to channel 36. In a simulation of the vendor test waveforms, FCC
+types 0-5 and ETSI types 1-6 are detected in 99.6-100 % of the trials,
+and random pulses (10-1000 per second, one hour) give no detection.
+
+Signed-off-by: Roman Rikhter <teledurak@gmail.com>
+---
+diff --git drivers/net/wireless/realtek/rtw89/Makefile drivers/net/wireless/realtek/rtw89/Makefile
+index adec3a3..0904d75 100644
+--- a/drivers/net/wireless/realtek/rtw89/Makefile
++++ b/drivers/net/wireless/realtek/rtw89/Makefile
+@@ -16,6 +16,7 @@ rtw89_core-y += core.o \
+ 		coex.o \
+ 		ps.o \
+ 		chan.o \
++		dfs.o \
+ 		ser.o \
+ 		acpi.o \
+ 		util.o
+diff --git drivers/net/wireless/realtek/rtw89/chan.c drivers/net/wireless/realtek/rtw89/chan.c
+index d7a4c23..17bc763 100644
+--- a/drivers/net/wireless/realtek/rtw89/chan.c
++++ b/drivers/net/wireless/realtek/rtw89/chan.c
+@@ -5,6 +5,7 @@
+ #include "chan.h"
+ #include "coex.h"
+ #include "debug.h"
++#include "dfs.h"
+ #include "fw.h"
+ #include "mac.h"
+ #include "phy.h"
+@@ -3382,6 +3383,7 @@ int rtw89_chanctx_ops_add(struct rtw89_dev *rtwdev,
+ 	cfg->idx = idx;
+ 	cfg->ref_count = 0;
+ 	hal->chanctx[idx].cfg = cfg;
++	rtw89_dfs_chanctx_radar(rtwdev, ctx->radar_enabled);
+ 	return 0;
+ }
+ 
+@@ -3391,6 +3393,7 @@ void rtw89_chanctx_ops_remove(struct rtw89_dev *rtwdev,
+ 	struct rtw89_chanctx_cfg *cfg = (struct rtw89_chanctx_cfg *)ctx->drv_priv;
+ 
+ 	rtw89_config_entity_chandef(rtwdev, cfg->idx, NULL);
++	rtw89_dfs_chanctx_radar(rtwdev, false);
+ }
+ 
+ void rtw89_chanctx_ops_change(struct rtw89_dev *rtwdev,
+@@ -3407,6 +3410,9 @@ void rtw89_chanctx_ops_change(struct rtw89_dev *rtwdev,
+ 
+ 	if (changed & IEEE80211_CHANCTX_CHANGE_PUNCTURING)
+ 		rtw89_chan_update_punctured(rtwdev, idx, &ctx->def);
++
++	if (changed & IEEE80211_CHANCTX_CHANGE_RADAR)
++		rtw89_dfs_chanctx_radar(rtwdev, ctx->radar_enabled);
+ }
+ 
+ int rtw89_chanctx_ops_assign_vif(struct rtw89_dev *rtwdev,
+diff --git drivers/net/wireless/realtek/rtw89/core.c drivers/net/wireless/realtek/rtw89/core.c
+index a8ee4c2..813bd9f 100644
+--- a/drivers/net/wireless/realtek/rtw89/core.c
++++ b/drivers/net/wireless/realtek/rtw89/core.c
+@@ -10,6 +10,7 @@
+ #include "chan.h"
+ #include "coex.h"
+ #include "core.h"
++#include "dfs.h"
+ #include "efuse.h"
+ #include "fw.h"
+ #include "mac.h"
+@@ -205,6 +206,27 @@ static const struct ieee80211_iface_combination rtw89_iface_combs[] = {
+ 	},
+ };
+ 
++#define RTW89_RADAR_DETECT_WIDTHS (BIT(NL80211_CHAN_WIDTH_20_NOHT) | \
++				   BIT(NL80211_CHAN_WIDTH_20) | \
++				   BIT(NL80211_CHAN_WIDTH_40) | \
++				   BIT(NL80211_CHAN_WIDTH_80))
++
++static const struct ieee80211_iface_combination rtw89_iface_combs_dfs[] = {
++	{
++		.limits = rtw89_iface_limits,
++		.n_limits = ARRAY_SIZE(rtw89_iface_limits),
++		.max_interfaces = RTW89_MAX_INTERFACE_NUM,
++		.num_different_channels = 1,
++		.radar_detect_widths = RTW89_RADAR_DETECT_WIDTHS,
++	},
++	{
++		.limits = rtw89_iface_limits_mcc,
++		.n_limits = ARRAY_SIZE(rtw89_iface_limits_mcc),
++		.max_interfaces = RTW89_MAX_INTERFACE_NUM,
++		.num_different_channels = 2,
++	},
++};
++
+ static const u8 rtw89_ext_capa_sta[] = {
+ 	[0] = WLAN_EXT_CAPA1_EXT_CHANNEL_SWITCHING,
+ 	[2] = WLAN_EXT_CAPA3_MULTI_BSSID_SUPPORT,
+@@ -575,6 +597,7 @@ int rtw89_set_channel(struct rtw89_dev *rtwdev)
+ 	rtw89_entity_get_conf(rtwdev, &conf);
+ 
+ 	__rtw89_set_channel(rtwdev, conf.chans[0], RTW89_MAC_0, RTW89_PHY_0);
++	rtw89_dfs_set_channel(rtwdev);
+ 
+ 	if (rtwdev->chip->chip_gen == RTW89_CHIP_AX)
+ 		return 0;
+@@ -4066,6 +4089,9 @@ static void rtw89_core_rx_process_report(struct rtw89_dev *rtwdev,
+ 	case RTW89_CORE_RX_TYPE_PPDU_STAT:
+ 		rtw89_core_rx_process_ppdu_sts(rtwdev, desc_info, skb);
+ 		break;
++	case RTW89_CORE_RX_TYPE_DFS_REPORT:
++		rtw89_dfs_rx_report(rtwdev, skb);
++		break;
+ 	default:
+ 		rtw89_debug(rtwdev, RTW89_DBG_TXRX, "unhandled pkt_type=%d\n",
+ 			    desc_info->pkt_type);
+@@ -5467,6 +5493,7 @@ static void rtw89_track_work(struct wiphy *wiphy, struct wiphy_work *work)
+ 	rtw89_phy_antdiv_track(rtwdev);
+ 	rtw89_phy_ul_tb_ctrl_track(rtwdev);
+ 	rtw89_phy_edcca_track(rtwdev);
++	rtw89_dfs_track(rtwdev);
+ 	rtw89_sar_track(rtwdev);
+ 	rtw89_chanctx_track(rtwdev);
+ 	rtw89_core_rfkill_poll(rtwdev, false);
+@@ -6956,6 +6983,7 @@ int rtw89_core_init(struct rtw89_dev *rtwdev)
+ 	skb_queue_head_init(&rtwdev->c2h_queue);
+ 	rtw89_core_ppdu_sts_init(rtwdev);
+ 	rtw89_traffic_stats_init(rtwdev, &rtwdev->stats);
++	rtw89_dfs_init(rtwdev);
+ 
+ 	rtwdev->hal.rx_fltr = DEFAULT_AX_RX_FLTR;
+ 	rtwdev->dbcc_en = false;
+@@ -7622,7 +7650,10 @@ struct rtw89_dev *rtw89_alloc_ieee80211_hw(struct device *device,
+ 		      RTW89_CHK_FW_FEATURE(NOTIFY_AP_INFO, &early_fw) &&
+ 		      RTW89_MLD_NON_STA_LINK_NUM == 1;
+ 
+-	hw->wiphy->iface_combinations = rtw89_iface_combs;
++	if (rtw89_dfs_supported(variant))
++		hw->wiphy->iface_combinations = rtw89_iface_combs_dfs;
++	else
++		hw->wiphy->iface_combinations = rtw89_iface_combs;
+ 
+ 	if (no_chanctx || chip->support_chanctx_num == 1)
+ 		hw->wiphy->n_iface_combinations = 1;
+diff --git drivers/net/wireless/realtek/rtw89/core.h drivers/net/wireless/realtek/rtw89/core.h
+index 712cd40..ac997dd 100644
+--- a/drivers/net/wireless/realtek/rtw89/core.h
++++ b/drivers/net/wireless/realtek/rtw89/core.h
+@@ -5884,6 +5884,55 @@ struct rtw89_regulatory_info {
+ 	DECLARE_BITMAP(block_6ghz_vlp, RTW89_REGD_MAX_COUNTRY_NUM);
+ };
+ 
++#define RTW89_DFS_RDR_TYPE_NUM 8
++
++struct rtw89_dfs_rdr_type {
++	u16 pw_min; /* unit: 200 ns */
++	u16 pw_max;
++	u8 pri_min; /* unit: 25 us */
++	u8 pri_max;
++	u8 ppb; /* pulses per burst; 0: unused */
++};
++
++struct rtw89_dfs_stats {
++	u32 rpt_pkts;
++	u32 pulses;
++	u32 hw_drops;
++	u32 batches;
++	u32 detected;
++	u32 drop_pw_max;
++	u32 drop_chrp_diff;
++	u32 drop_seq;
++	u32 ignored;
++};
++
++struct rtw89_dfs_info {
++	spinlock_t lock;
++	bool supported;
++	bool rpt_en;
++	bool chanctx_radar;
++	enum nl80211_dfs_regions region;
++	const struct rtw89_dfs_rdr_type *types;
++	bool long_rdr;
++	bool etsi;
++
++	bool idle;
++	u8 pw_factor;
++	u8 pri_factor;
++	u8 ppb_prcnt;
++	u16 pw_diff_th;
++	u16 pri_diff_th;
++	u16 pw_lng_chrp_diff_th;
++
++	bool chrp_obsrv;
++	unsigned long chrp_start;
++	u8 lng_rdr_cnt;
++	u8 lng_rdr_cnt_pre;
++	u8 last_seq;
++
++	struct rtw89_dfs_stats stats;
++};
++
+ enum rtw89_ifs_clm_application {
+ 	RTW89_IFS_CLM_INIT = 0,
+ 	RTW89_IFS_CLM_BACKGROUND = 1,
+@@ -6546,6 +6595,7 @@ struct rtw89_dev {
+ 	bool scanning;
+ 
+ 	struct rtw89_regulatory_info regulatory;
++	struct rtw89_dfs_info dfs;
+ 	struct rtw89_sar_info sar;
+ 	struct rtw89_tas_info tas;
+ 	struct rtw89_ant_gain_info ant_gain;
+diff --git drivers/net/wireless/realtek/rtw89/debug.c drivers/net/wireless/realtek/rtw89/debug.c
+index ca9712e..1209fa3 100644
+--- a/drivers/net/wireless/realtek/rtw89/debug.c
++++ b/drivers/net/wireless/realtek/rtw89/debug.c
+@@ -7,6 +7,7 @@
+ 
+ #include "coex.h"
+ #include "debug.h"
++#include "dfs.h"
+ #include "fw.h"
+ #include "mac.h"
+ #include "pci.h"
+@@ -94,6 +95,7 @@ struct rtw89_debugfs {
+ 	struct rtw89_debugfs_priv diag_mac;
+ 	struct rtw89_debugfs_priv diag_bb;
+ 	struct rtw89_debugfs_priv monitor_opts;
++	struct rtw89_debugfs_priv dfs;
+ };
+ 
+ struct rtw89_debugfs_iter_data {
+@@ -5444,6 +5446,58 @@ rtw89_debug_priv_monitor_opts_set(struct rtw89_dev *rtwdev,
+ 	return count;
+ }
+ 
++static ssize_t
++rtw89_debug_priv_dfs_get(struct rtw89_dev *rtwdev,
++			 struct rtw89_debugfs_priv *debugfs_priv,
++			 char *buf, size_t bufsz)
++{
++	struct rtw89_dfs_info *dfs = &rtwdev->dfs;
++	struct rtw89_dfs_stats *stats = &dfs->stats;
++	char *p = buf, *end = buf + bufsz;
++
++	if (!dfs->supported) {
++		p += scnprintf(p, end - p, "radar detection not supported\n");
++		return p - buf;
++	}
++
++	p += scnprintf(p, end - p, "region: %s\n",
++		       rtw89_dfs_region_str(dfs->region));
++	p += scnprintf(p, end - p, "report: %s, radar detection requested: %d\n",
++		       dfs->rpt_en ? "on" : "off",
++		       rtwdev->hw->conf.radar_enabled || dfs->chanctx_radar);
++	p += scnprintf(p, end - p, "mode: %s, long radar count: %u\n",
++		       dfs->idle ? "idle" : "traffic", dfs->lng_rdr_cnt);
++	p += scnprintf(p, end - p,
++		       "reports: %u, pulses: %u, hw drops: %u, batches: %u, ignored: %u\n",
++		       stats->rpt_pkts, stats->pulses, stats->hw_drops,
++		       stats->batches, stats->ignored);
++	p += scnprintf(p, end - p,
++		       "detected: %u, dropped: pw_max %u, chirp pw %u, seq %u\n",
++		       stats->detected, stats->drop_pw_max,
++		       stats->drop_chrp_diff, stats->drop_seq);
++	p += scnprintf(p, end - p, "\nwrite 1 to simulate a radar\n");
++
++	return p - buf;
++}
++
++static ssize_t
++rtw89_debug_priv_dfs_set(struct rtw89_dev *rtwdev,
++			 struct rtw89_debugfs_priv *debugfs_priv,
++			 const char *buf, size_t count)
++{
++	bool radar;
++	int ret;
++
++	ret = kstrtobool(buf, &radar);
++	if (ret)
++		return -EINVAL;
++
++	if (radar)
++		rtw89_dfs_simulate_radar(rtwdev);
++
++	return count;
++}
++
+ #define rtw89_debug_priv_get(name, opts...)			\
+ {								\
+ 	.cb_read = rtw89_debug_priv_ ##name## _get,		\
+@@ -5509,6 +5563,7 @@ static const struct rtw89_debugfs rtw89_debugfs_templ = {
+ 	.diag_mac = rtw89_debug_priv_get(diag_mac, RSIZE_16K, RLOCK),
+ 	.diag_bb = rtw89_debug_priv_get(diag_bb, RSIZE_8K, RLOCK),
+ 	.monitor_opts = rtw89_debug_priv_set_and_get(monitor_opts, RWLOCK),
++	.dfs = rtw89_debug_priv_set_and_get(dfs, RWLOCK),
+ };
+ 
+ #define rtw89_debugfs_add(name, mode, fopname, parent)				\
+@@ -5566,6 +5621,7 @@ void rtw89_debugfs_add_sec2(struct rtw89_dev *rtwdev, struct dentry *debugfs_top
+ 	rtw89_debugfs_add_r(diag_mac);
+ 	rtw89_debugfs_add_r(diag_bb);
+ 	rtw89_debugfs_add_rw(monitor_opts);
++	rtw89_debugfs_add_rw(dfs);
+ }
+ 
+ void rtw89_debugfs_init(struct rtw89_dev *rtwdev)
+diff --git drivers/net/wireless/realtek/rtw89/debug.h drivers/net/wireless/realtek/rtw89/debug.h
+index fc1c964..495c44f 100644
+--- a/drivers/net/wireless/realtek/rtw89/debug.h
++++ b/drivers/net/wireless/realtek/rtw89/debug.h
+@@ -32,6 +32,7 @@ enum rtw89_debug_mask {
+ 	RTW89_DBG_ACPI = BIT(21),
+ 	RTW89_DBG_EDCCA = BIT(22),
+ 	RTW89_DBG_PS = BIT(23),
++	RTW89_DBG_DFS = BIT(24),
+ 
+ 	RTW89_DBG_UNEXP = BIT(31),
+ };
+diff --git drivers/net/wireless/realtek/rtw89/dfs.c drivers/net/wireless/realtek/rtw89/dfs.c
+new file mode 100644
+index 0000000..3d79570
+--- /dev/null
++++ b/drivers/net/wireless/realtek/rtw89/dfs.c
+@@ -0,0 +1,595 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright(c) 2007 - 2020  Realtek Corporation
++ *
++ * Radar detection, ported from the gen0 detector of Realtek's halbb
++ * (halbb_dfs.c) as the vendor driver runs it on the RTL8832BR.
++ *
++ * The BB reports each pulse it sees (width, interval to the previous
++ * pulse, chirp flag). The MAC collects the reports and sends them to the
++ * host in batches of up to 61 pulses or after 80 ms. Each batch is matched
++ * against the radar types of the DFS region; long (chirp) radars are
++ * counted across batches.
++ */
++
++#include <linux/unaligned.h>
++
++#include "debug.h"
++#include "dfs.h"
++#include "reg.h"
++
++#define RTW89_DFS_RPT_HDR_LEN 8
++#define RTW89_DFS_RPT_HDR_DROP_NUM GENMASK(15, 0)
++#define RTW89_DFS_RPT_LEN 8
++#define RTW89_DFS_RPT_CHIRP BIT_ULL(0)
++#define RTW89_DFS_RPT_PRI GENMASK_ULL(8, 1)
++#define RTW89_DFS_RPT_PW GENMASK_ULL(18, 9)
++#define RTW89_DFS_RPT_SEQ GENMASK_ULL(63, 57)
++#define RTW89_DFS_SEQ_MAX 127
++
++#define RTW89_DFS_BUF_64 1
++#define RTW89_DFS_NUM_TH_61 1
++#define RTW89_DFS_TIME_TH_80MS 3
++
++#define RTW89_DFS_LONG_IDX 6
++#define RTW89_DFS_ETSI_CHIRP_IDX 3
++#define RTW89_DFS_ETSI_TYPE5_IDX 4
++#define RTW89_DFS_ETSI_TYPE6_IDX 5
++#define RTW89_DFS_FAKE_NUM_TH 5
++#define RTW89_DFS_PRI_UBD_MAX 0xdc
++#define RTW89_DFS_PW_MAX_TH 660
++#define RTW89_DFS_CHRP_CNT_TH 4
++#define RTW89_DFS_LONG_INC_TH 1
++#define RTW89_DFS_LONG_PERIOD (12 * HZ)
++#define RTW89_DFS_TP_TH 2 /* Mbps */
++
++/* {pw_min, pw_max, pri_min, pri_max, ppb}; PW unit 200 ns, PRI unit 25 us */
++static const struct rtw89_dfs_rdr_type rtw89_dfs_fcc[RTW89_DFS_RDR_TYPE_NUM] = {
++	{5, 5, 20, 123, 18},		/* type 1 */
++	{5, 25, 6, 10, 23},		/* type 2 */
++	{30, 50, 8, 20, 16},		/* type 3 */
++	{55, 100, 8, 20, 12},		/* type 4 */
++	{5, 5, 13, 14, 15},		/* type 6 */
++	{5, 5, 57, 58, 18},		/* type 0 */
++	{250, 500, 40, 80, 15},		/* type 5, long chirp */
++};
++
++static const struct rtw89_dfs_rdr_type rtw89_dfs_etsi[RTW89_DFS_RDR_TYPE_NUM] = {
++	{2, 25, 40, 200, 9},		/* type 1 */
++	{2, 75, 25, 200, 15},		/* type 2 */
++	{2, 150, 10, 18, 25},		/* type 3 */
++	{100, 150, 10, 20, 20},		/* type 4, chirp */
++	{2, 15, 100, 134, 20},		/* type 5 */
++	{2, 15, 33, 100, 30},		/* type 6 */
++	{5, 5, 57, 58, 18},		/* reference */
++};
++
++static const struct rtw89_dfs_rdr_type rtw89_dfs_mkk_w53[RTW89_DFS_RDR_TYPE_NUM] = {
++	{2, 25, 40, 200, 10},
++	{2, 75, 25, 200, 15},
++	{2, 25, 30, 196, 22},
++	{2, 75, 15, 196, 22},
++	{2, 8, 24, 32, 30},
++	{2, 8, 32, 39, 25},
++	{2, 8, 34, 41, 24},
++	{2, 8, 43, 51, 20},
++};
++
++static const struct rtw89_dfs_rdr_type rtw89_dfs_mkk_w56[RTW89_DFS_RDR_TYPE_NUM] = {
++	{2, 3, 55, 56, 18},
++	{5, 5, 57, 58, 18},
++	{10, 11, 80, 160, 10},
++	{5, 25, 6, 10, 23},
++	{30, 50, 8, 20, 16},
++	{55, 100, 8, 20, 12},
++	{250, 500, 40, 80, 15},		/* long chirp */
++	{5, 5, 13, 14, 18},
++};
++
++struct rtw89_dfs_bound {
++	u16 pw_lbd;
++	u16 pw_ubd;
++	u8 pri_lbd;
++	u8 pri_ubd;
++	u8 ppb_th;
++};
++
++struct rtw89_dfs_range {
++	u16 min;
++	u16 max;
++};
++
++struct rtw89_dfs_batch {
++	struct rtw89_dfs_bound bnd[RTW89_DFS_RDR_TYPE_NUM];
++	u8 cnt[RTW89_DFS_RDR_TYPE_NUM];
++	struct rtw89_dfs_range pw[RTW89_DFS_RDR_TYPE_NUM];
++	struct rtw89_dfs_range pri[RTW89_DFS_RDR_TYPE_NUM];
++	struct rtw89_dfs_range chrp_pw;
++	struct rtw89_dfs_range lng_pw;
++	u8 chrp_cnt;
++	u16 pw_max;
++	bool n_seq;
++};
++
++bool rtw89_dfs_supported(const struct rtw89_chip_variant *variant)
++{
++	return variant && variant->rtl8832br;
++}
++
++const char *rtw89_dfs_region_str(enum nl80211_dfs_regions region)
++{
++	switch (region) {
++	case NL80211_DFS_FCC:
++		return "FCC";
++	case NL80211_DFS_ETSI:
++		return "ETSI";
++	case NL80211_DFS_JP:
++		return "JP";
++	default:
++		return "unset";
++	}
++}
++
++static void rtw89_dfs_range_init(struct rtw89_dfs_range *r)
++{
++	r->min = U16_MAX;
++	r->max = 0;
++}
++
++static void rtw89_dfs_range_add(struct rtw89_dfs_range *r, u16 val)
++{
++	r->min = min(r->min, val);
++	r->max = max(r->max, val);
++}
++
++static u16 rtw89_dfs_range_diff(const struct rtw89_dfs_range *r)
++{
++	return r->max >= r->min ? r->max - r->min : 0;
++}
++
++static void rtw89_dfs_set_dyn(struct rtw89_dfs_info *dfs, bool idle)
++{
++	dfs->idle = idle;
++
++	if (idle) {
++		dfs->pw_diff_th = 12;
++		dfs->pw_lng_chrp_diff_th = 18;
++		dfs->pri_diff_th = 5;
++		dfs->pw_factor = 1;
++		dfs->pri_factor = 1;
++		dfs->ppb_prcnt = 5;
++	} else {
++		dfs->pw_diff_th = 20;
++		dfs->pw_lng_chrp_diff_th = 20;
++		dfs->pri_diff_th = 120;
++		dfs->pw_factor = 3;
++		dfs->pri_factor = 3;
++		dfs->ppb_prcnt = 4;
++	}
++}
++
++static void rtw89_dfs_reset(struct rtw89_dfs_info *dfs)
++{
++	dfs->chrp_obsrv = false;
++	dfs->lng_rdr_cnt = 0;
++	dfs->lng_rdr_cnt_pre = 0;
++	dfs->last_seq = 0;
++}
++
++static bool rtw89_dfs_chandef_has(const struct cfg80211_chan_def *chandef,
++				  u32 freq_lo, u32 freq_hi)
++{
++	u32 width = cfg80211_chandef_get_width(chandef);
++	u32 freq;
++
++	for (freq = chandef->center_freq1 - width / 2 + 10;
++	     freq < chandef->center_freq1 + width / 2; freq += 20)
++		if (freq >= freq_lo && freq <= freq_hi)
++			return true;
++
++	return false;
++}
++
++static void rtw89_dfs_select_types(struct rtw89_dfs_info *dfs,
++				   const struct cfg80211_chan_def *chandef)
++{
++	dfs->types = NULL;
++	dfs->long_rdr = false;
++	dfs->etsi = false;
++
++	switch (dfs->region) {
++	case NL80211_DFS_FCC:
++		dfs->types = rtw89_dfs_fcc;
++		dfs->long_rdr = true;
++		break;
++	case NL80211_DFS_ETSI:
++		dfs->types = rtw89_dfs_etsi;
++		dfs->etsi = true;
++		break;
++	case NL80211_DFS_JP:
++		if (!chandef)
++			break;
++		if (rtw89_dfs_chandef_has(chandef, 5260, 5320)) {
++			dfs->types = rtw89_dfs_mkk_w53;
++		} else if (rtw89_dfs_chandef_has(chandef, 5500, 5720)) {
++			dfs->types = rtw89_dfs_mkk_w56;
++			dfs->long_rdr = true;
++		}
++		break;
++	default:
++		break;
++	}
++}
++
++static const struct cfg80211_chan_def *rtw89_dfs_chandef(struct rtw89_dev *rtwdev)
++{
++	const struct cfg80211_chan_def *chandef;
++
++	chandef = rtw89_chandef_get(rtwdev, RTW89_CHANCTX_0);
++	if (!chandef->chan || !cfg80211_chandef_valid(chandef))
++		return NULL;
++
++	return chandef;
++}
++
++static void rtw89_dfs_hw_rpt(struct rtw89_dev *rtwdev, bool en)
++{
++	u32 val;
++	u8 cfg;
++	int ret;
++
++	if (en) {
++		/* the MAC function init leaves the BB report block off */
++		rtw89_write32_set(rtwdev, R_AX_DMAC_CLK_EN, B_AX_BBRPT_CLK_EN);
++		rtw89_write32_set(rtwdev, R_AX_DMAC_FUNC_EN, B_AX_BBRPT_EN);
++
++		/* queue and port 0: to the host */
++		val = B_AX_DFS_RPT_EN |
++		      u32_encode_bits(RTW89_DFS_BUF_64, B_AX_DFS_BUF_MASK) |
++		      u32_encode_bits(RTW89_DFS_NUM_TH_61, B_AX_DFS_NUM_TH_MASK) |
++		      u32_encode_bits(RTW89_DFS_TIME_TH_80MS, B_AX_DFS_TIME_TH_MASK);
++		rtw89_write32(rtwdev, R_AX_DFS_CFG0, val);
++		return;
++	}
++
++	cfg = rtw89_read8(rtwdev, R_AX_DFS_CFG0);
++	if (!(cfg & B_AX_DFS_RPT_EN))
++		return;
++
++	rtw89_write8(rtwdev, R_AX_DFS_CFG0, cfg | B_AX_STOP_DFS);
++	ret = read_poll_timeout_atomic(rtw89_read8, val, val & B_AX_DFS_IN_STOP,
++				       1, 3000, false, rtwdev, R_AX_DFS_CFG0);
++	if (ret)
++		rtw89_warn(rtwdev, "failed to stop DFS report\n");
++	rtw89_write8(rtwdev, R_AX_DFS_CFG0, cfg & ~B_AX_DFS_RPT_EN);
++}
++
++void rtw89_dfs_init(struct rtw89_dev *rtwdev)
++{
++	struct rtw89_dfs_info *dfs = &rtwdev->dfs;
++
++	spin_lock_init(&dfs->lock);
++	dfs->supported = rtw89_dfs_supported(rtwdev->variant);
++	dfs->region = NL80211_DFS_UNSET;
++	rtw89_dfs_set_dyn(dfs, true);
++	rtw89_dfs_reset(dfs);
++}
++
++void rtw89_dfs_set_region(struct rtw89_dev *rtwdev,
++			  enum nl80211_dfs_regions region)
++{
++	struct rtw89_dfs_info *dfs = &rtwdev->dfs;
++
++	if (!dfs->supported || dfs->region == region)
++		return;
++
++	spin_lock_bh(&dfs->lock);
++	dfs->region = region;
++	rtw89_dfs_select_types(dfs, rtw89_dfs_chandef(rtwdev));
++	rtw89_dfs_reset(dfs);
++	spin_unlock_bh(&dfs->lock);
++
++	rtw89_debug(rtwdev, RTW89_DBG_DFS, "DFS region %s\n",
++		    rtw89_dfs_region_str(region));
++}
++
++void rtw89_dfs_set_channel(struct rtw89_dev *rtwdev)
++{
++	struct rtw89_dfs_info *dfs = &rtwdev->dfs;
++	const struct cfg80211_chan_def *chandef;
++	bool radar = false;
++
++	if (!dfs->supported)
++		return;
++
++	chandef = rtw89_dfs_chandef(rtwdev);
++	if (chandef)
++		radar = cfg80211_chandef_dfs_required(rtwdev->hw->wiphy, chandef,
++						      NL80211_IFTYPE_AP) > 0;
++
++	spin_lock_bh(&dfs->lock);
++	rtw89_dfs_select_types(dfs, chandef);
++	rtw89_dfs_reset(dfs);
++	dfs->rpt_en = radar && dfs->types;
++	spin_unlock_bh(&dfs->lock);
++
++	/* the BB detector itself is enabled with each channel setting */
++	rtw89_dfs_hw_rpt(rtwdev, dfs->rpt_en);
++
++	rtw89_debug(rtwdev, RTW89_DBG_DFS, "DFS report %s (radar channel %d, region %s)\n",
++		    dfs->rpt_en ? "on" : "off", radar,
++		    rtw89_dfs_region_str(dfs->region));
++
++	if (radar && !dfs->types)
++		rtw89_warn(rtwdev, "no radar detection for DFS region %s\n",
++			   rtw89_dfs_region_str(dfs->region));
++}
++
++void rtw89_dfs_chanctx_radar(struct rtw89_dev *rtwdev, bool enabled)
++{
++	WRITE_ONCE(rtwdev->dfs.chanctx_radar, enabled);
++}
++
++static bool rtw89_dfs_radar_enabled(struct rtw89_dev *rtwdev)
++{
++	/* hw->conf is kept by mac80211 when it emulates channel contexts */
++	return rtwdev->hw->conf.radar_enabled ||
++	       READ_ONCE(rtwdev->dfs.chanctx_radar);
++}
++
++void rtw89_dfs_track(struct rtw89_dev *rtwdev)
++{
++	struct rtw89_traffic_stats *stats = &rtwdev->stats;
++	struct rtw89_dfs_info *dfs = &rtwdev->dfs;
++	bool idle;
++
++	if (!dfs->supported)
++		return;
++
++	idle = stats->tx_throughput + stats->rx_throughput < RTW89_DFS_TP_TH;
++	if (idle == dfs->idle)
++		return;
++
++	spin_lock_bh(&dfs->lock);
++	rtw89_dfs_set_dyn(dfs, idle);
++	spin_unlock_bh(&dfs->lock);
++}
++
++static void rtw89_dfs_batch_init(struct rtw89_dfs_info *dfs,
++				 struct rtw89_dfs_batch *b)
++{
++	int i;
++
++	memset(b, 0, sizeof(*b));
++
++	for (i = 0; i < RTW89_DFS_RDR_TYPE_NUM; i++) {
++		const struct rtw89_dfs_rdr_type *t = &dfs->types[i];
++		struct rtw89_dfs_bound *bnd = &b->bnd[i];
++
++		bnd->ppb_th = (t->ppb * dfs->ppb_prcnt) >> 3;
++		bnd->pw_lbd = min(t->pw_min - 1,
++				  (t->pw_min * (8 - dfs->pw_factor)) >> 3);
++		bnd->pw_ubd = max(t->pw_max + 1,
++				  (t->pw_max * (8 + dfs->pw_factor)) >> 3);
++		bnd->pri_lbd = (t->pri_min * (8 - dfs->pri_factor)) >> 3;
++		bnd->pri_ubd = min((t->pri_max * (8 + dfs->pri_factor)) >> 3,
++				   RTW89_DFS_PRI_UBD_MAX);
++
++		rtw89_dfs_range_init(&b->pw[i]);
++		rtw89_dfs_range_init(&b->pri[i]);
++	}
++
++	rtw89_dfs_range_init(&b->chrp_pw);
++	rtw89_dfs_range_init(&b->lng_pw);
++}
++
++static void rtw89_dfs_chrp_mntr(struct rtw89_dfs_info *dfs, bool chirp)
++{
++	if (!dfs->chrp_obsrv ||
++	    time_after_eq(jiffies, dfs->chrp_start + RTW89_DFS_LONG_PERIOD)) {
++		dfs->chrp_obsrv = false;
++		dfs->lng_rdr_cnt = 0;
++	}
++
++	if (chirp && !dfs->chrp_obsrv) {
++		dfs->chrp_start = jiffies;
++		dfs->chrp_obsrv = true;
++	}
++}
++
++static void rtw89_dfs_match(struct rtw89_dfs_info *dfs,
++			    struct rtw89_dfs_batch *b, u32 idx,
++			    u16 pw, u8 pri, bool chirp)
++{
++	int i;
++
++	if (dfs->long_rdr)
++		rtw89_dfs_chrp_mntr(dfs, chirp);
++
++	if (chirp) {
++		b->chrp_cnt++;
++		rtw89_dfs_range_add(&b->chrp_pw, pw);
++	}
++
++	for (i = 0; i < RTW89_DFS_RDR_TYPE_NUM; i++) {
++		const struct rtw89_dfs_bound *bnd = &b->bnd[i];
++		bool pw_ok = pw >= bnd->pw_lbd && pw <= bnd->pw_ubd;
++		bool pri_ok = pri >= bnd->pri_lbd && pri <= bnd->pri_ubd;
++
++		if (!bnd->ppb_th || !pw_ok)
++			continue;
++
++		if (i == RTW89_DFS_LONG_IDX && dfs->long_rdr) {
++			/* the interval of the first pulse is not a real one */
++			if (!chirp || (idx ? !pri_ok : !pri))
++				continue;
++
++			dfs->lng_rdr_cnt++;
++			rtw89_dfs_range_add(&b->lng_pw, pw);
++			continue;
++		}
++
++		if (!pri_ok)
++			continue;
++
++		if (dfs->etsi && i == RTW89_DFS_ETSI_CHIRP_IDX) {
++			if (!chirp)
++				continue;
++		} else if (chirp) {
++			continue;
++		}
++
++		b->cnt[i]++;
++		rtw89_dfs_range_add(&b->pw[i], pw);
++
++		/* ETSI types 5 and 6 use several intervals */
++		if (dfs->etsi && (i == RTW89_DFS_ETSI_TYPE5_IDX ||
++				  i == RTW89_DFS_ETSI_TYPE6_IDX))
++			continue;
++
++		if (idx)
++			rtw89_dfs_range_add(&b->pri[i], pri);
++	}
++}
++
++static int rtw89_dfs_detect(struct rtw89_dev *rtwdev, const u8 *data, u32 num)
++{
++	struct rtw89_dfs_info *dfs = &rtwdev->dfs;
++	struct rtw89_dfs_batch b;
++	int type = -1;
++	u32 i;
++
++	/* too few pulses for any radar without a long one */
++	if (!dfs->long_rdr && num < RTW89_DFS_FAKE_NUM_TH)
++		return -1;
++
++	dfs->stats.batches++;
++	rtw89_dfs_batch_init(dfs, &b);
++
++	for (i = 0; i < num; i++) {
++		u64 rpt = get_unaligned_le64(data + i * RTW89_DFS_RPT_LEN);
++		bool chirp = rpt & RTW89_DFS_RPT_CHIRP;
++		u8 pri = u64_get_bits(rpt, RTW89_DFS_RPT_PRI);
++		u16 pw = u64_get_bits(rpt, RTW89_DFS_RPT_PW);
++		u8 seq = u64_get_bits(rpt, RTW89_DFS_RPT_SEQ);
++
++		rtw89_debug(rtwdev, RTW89_DBG_DFS,
++			    "DFS pulse %016llx: pw %u pri %u chirp %d seq %u\n",
++			    rpt, pw, pri, chirp, seq);
++
++		rtw89_dfs_match(dfs, &b, i, pw, pri, chirp);
++
++		if (i && (dfs->last_seq == RTW89_DFS_SEQ_MAX ? seq != 0 :
++			  abs(seq - dfs->last_seq) > 1))
++			b.n_seq = true;
++		dfs->last_seq = seq;
++
++		b.pw_max = max(b.pw_max, pw);
++	}
++
++	if (dfs->long_rdr) {
++		if (rtw89_dfs_range_diff(&b.lng_pw) > dfs->pw_lng_chrp_diff_th ||
++		    rtw89_dfs_range_diff(&b.chrp_pw) > dfs->pw_lng_chrp_diff_th ||
++		    b.pw_max > RTW89_DFS_PW_MAX_TH ||
++		    b.chrp_cnt > RTW89_DFS_CHRP_CNT_TH)
++			dfs->lng_rdr_cnt = 0;
++
++		/* An increase by one pulse is not reliable. As in the vendor
++		 * driver, this also takes back the resets above.
++		 */
++		if ((int)dfs->lng_rdr_cnt - dfs->lng_rdr_cnt_pre <=
++		    RTW89_DFS_LONG_INC_TH)
++			dfs->lng_rdr_cnt = dfs->lng_rdr_cnt_pre;
++	}
++
++	for (i = 0; i < RTW89_DFS_RDR_TYPE_NUM; i++) {
++		const struct rtw89_dfs_bound *bnd = &b.bnd[i];
++
++		if (!bnd->ppb_th)
++			continue;
++
++		if (i == RTW89_DFS_LONG_IDX && dfs->long_rdr) {
++			if (dfs->lng_rdr_cnt >= bnd->ppb_th)
++				type = i;
++			continue;
++		}
++
++		if (b.cnt[i] < bnd->ppb_th ||
++		    rtw89_dfs_range_diff(&b.pw[i]) > dfs->pw_diff_th ||
++		    rtw89_dfs_range_diff(&b.pri[i]) > dfs->pri_diff_th)
++			continue;
++
++		type = i;
++	}
++
++	rtw89_debug(rtwdev, RTW89_DBG_DFS,
++		    "DFS batch: %u pulses, cnt %*ph, lng %u, chrp %u, pw_max %u, n_seq %d, type %d\n",
++		    num, RTW89_DFS_RDR_TYPE_NUM, b.cnt, dfs->lng_rdr_cnt,
++		    b.chrp_cnt, b.pw_max, b.n_seq, type);
++
++	if (type >= 0) {
++		/* drop what looks like false detection */
++		if (b.pw_max > RTW89_DFS_PW_MAX_TH) {
++			dfs->stats.drop_pw_max++;
++			type = -1;
++		} else if (rtw89_dfs_range_diff(&b.chrp_pw) > dfs->pw_lng_chrp_diff_th) {
++			dfs->stats.drop_chrp_diff++;
++			type = -1;
++		} else if (b.n_seq) {
++			dfs->stats.drop_seq++;
++			type = -1;
++		}
++	}
++
++	if (type >= 0) {
++		dfs->lng_rdr_cnt = 0;
++		dfs->stats.detected++;
++	}
++
++	dfs->lng_rdr_cnt_pre = dfs->lng_rdr_cnt;
++
++	return type;
++}
++
++void rtw89_dfs_rx_report(struct rtw89_dev *rtwdev, struct sk_buff *skb)
++{
++	struct rtw89_dfs_info *dfs = &rtwdev->dfs;
++	u32 num, drop;
++	int type = -1;
++
++	if (!dfs->supported || skb->len < RTW89_DFS_RPT_HDR_LEN)
++		goto out;
++
++	num = (skb->len - RTW89_DFS_RPT_HDR_LEN) / RTW89_DFS_RPT_LEN;
++	drop = u32_get_bits(get_unaligned_le32(skb->data),
++			    RTW89_DFS_RPT_HDR_DROP_NUM);
++
++	spin_lock(&dfs->lock);
++
++	dfs->stats.rpt_pkts++;
++	dfs->stats.pulses += num;
++	dfs->stats.hw_drops += drop;
++
++	if (!dfs->rpt_en || rtwdev->scanning || !rtw89_dfs_radar_enabled(rtwdev))
++		dfs->stats.ignored++;
++	else
++		type = rtw89_dfs_detect(rtwdev,
++					skb->data + RTW89_DFS_RPT_HDR_LEN, num);
++
++	spin_unlock(&dfs->lock);
++
++	if (type < 0)
++		goto out;
++
++	rtw89_info(rtwdev, "radar detected (%s type index %d)\n",
++		   rtw89_dfs_region_str(dfs->region), type);
++	ieee80211_radar_detected(rtwdev->hw, NULL);
++
++out:
++	dev_kfree_skb_any(skb);
++}
++
++void rtw89_dfs_simulate_radar(struct rtw89_dev *rtwdev)
++{
++	rtw89_info(rtwdev, "simulated radar\n");
++	ieee80211_radar_detected(rtwdev->hw, NULL);
++}
+diff --git drivers/net/wireless/realtek/rtw89/dfs.h drivers/net/wireless/realtek/rtw89/dfs.h
+new file mode 100644
+index 0000000..b995cfa
+--- /dev/null
++++ b/drivers/net/wireless/realtek/rtw89/dfs.h
+@@ -0,0 +1,21 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* Copyright(c) 2007 - 2020  Realtek Corporation
++ */
++
++#ifndef __RTW89_DFS_H__
++#define __RTW89_DFS_H__
++
++#include "core.h"
++
++bool rtw89_dfs_supported(const struct rtw89_chip_variant *variant);
++const char *rtw89_dfs_region_str(enum nl80211_dfs_regions region);
++void rtw89_dfs_init(struct rtw89_dev *rtwdev);
++void rtw89_dfs_set_region(struct rtw89_dev *rtwdev,
++			  enum nl80211_dfs_regions region);
++void rtw89_dfs_set_channel(struct rtw89_dev *rtwdev);
++void rtw89_dfs_chanctx_radar(struct rtw89_dev *rtwdev, bool enabled);
++void rtw89_dfs_track(struct rtw89_dev *rtwdev);
++void rtw89_dfs_rx_report(struct rtw89_dev *rtwdev, struct sk_buff *skb);
++void rtw89_dfs_simulate_radar(struct rtw89_dev *rtwdev);
++
++#endif
+diff --git drivers/net/wireless/realtek/rtw89/reg.h drivers/net/wireless/realtek/rtw89/reg.h
+index 5904954..b005ad2 100644
+--- a/drivers/net/wireless/realtek/rtw89/reg.h
++++ b/drivers/net/wireless/realtek/rtw89/reg.h
+@@ -1741,6 +1741,16 @@
+ 				   B_AX_BBPRT_CHIF_NULL_ERR_INT_EN | \
+ 				   B_AX_BBPRT_CHIF_TO_ERR_INT_EN)
+ 
++#define R_AX_DFS_CFG0 0x9630
++#define B_AX_DFS_QID_MASK GENMASK(29, 24)
++#define B_AX_DFS_PRTID_MASK GENMASK(22, 20)
++#define B_AX_DFS_TIME_TH_MASK GENMASK(11, 10)
++#define B_AX_DFS_NUM_TH_MASK GENMASK(9, 8)
++#define B_AX_DFS_BUF_MASK GENMASK(7, 6)
++#define B_AX_DFS_IN_STOP BIT(5)
++#define B_AX_STOP_DFS BIT(4)
++#define B_AX_DFS_RPT_EN BIT(0)
++
+ #define R_AX_BBRPT_DFS_ERR_IMR 0x9638
+ #define B_AX_BBRPT_DFS_TO_ERR_INT_EN BIT(0)
+ 
+diff --git drivers/net/wireless/realtek/rtw89/regd.c drivers/net/wireless/realtek/rtw89/regd.c
+index 14fab6b..da05935 100644
+--- a/drivers/net/wireless/realtek/rtw89/regd.c
++++ b/drivers/net/wireless/realtek/rtw89/regd.c
+@@ -4,6 +4,7 @@
+ 
+ #include "acpi.h"
+ #include "debug.h"
++#include "dfs.h"
+ #include "ps.h"
+ #include "util.h"
+ 
+@@ -917,6 +918,7 @@ policy:
+ 	rtw89_regd_apply_policy_6ghz(rtwdev, wiphy);
+ 	rtw89_regd_apply_policy_tas(rtwdev);
+ 	rtw89_regd_apply_policy_ant_gain(rtwdev);
++	rtw89_dfs_set_region(rtwdev, request->dfs_region);
+ 
+ 	rtw89_core_set_chip_txpwr(rtwdev);
+ 
