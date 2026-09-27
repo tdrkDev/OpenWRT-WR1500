@@ -1,0 +1,649 @@
+From: Roman Rikhter <teledurak@gmail.com>
+Subject: [PATCH] wifi: rtw88: 8197g: add DPK
+
+The firmware of the RTL8197G does no digital predistortion calibration:
+port the DPK of the vendor driver (version 0x9), which runs after IQK on
+every channel set. For each path it scans the PA output through the TX
+loopback, moves the TX gain and the PGA until the gain loss is in range,
+lets the LMS engine fill the LUT of the predistortion and turns the
+predistortion on when the scan and the first LUT entries are in range.
+The watchdog then moves the power scaling factor of each calibrated path
+with its thermal meter, as the vendor driver does for all but the A cut.
+
+On a WR1500 (cut B, RFE type 0) both paths calibrate at a gain loss
+index of 7 with the TX gain at 0x18. A phone 30 cm away receives at
+MCS15 without retries either way (91 Mbit/s TCP with DPK, 89 without);
+the gain is in the EVM at higher output power, which this setup does not
+measure.
+
+Signed-off-by: Roman Rikhter <teledurak@gmail.com>
+---
+diff --git drivers/net/wireless/realtek/rtw88/main.h drivers/net/wireless/realtek/rtw88/main.h
+index 20dae48..612bfe4 100644
+--- a/drivers/net/wireless/realtek/rtw88/main.h
++++ b/drivers/net/wireless/realtek/rtw88/main.h
+@@ -1621,6 +1621,8 @@ struct rtw_dpk_info {
+ 	u16 dpk_gs[RTW_RF_PATH_MAX];
+ 	u8 thermal_dpk_delta[RTW_RF_PATH_MAX];
+ 	u8 pre_pwsf[RTW_RF_PATH_MAX];
++	/* power scaling factor of the calibration, where the chip tracks it */
++	u8 pwsf[RTW_RF_PATH_MAX];
+ 
+ 	u8 dpk_band;
+ 	u8 dpk_ch;
+diff --git drivers/net/wireless/realtek/rtw88/rtw8197g.c drivers/net/wireless/realtek/rtw88/rtw8197g.c
+index baa6b76..386bc48 100644
+--- a/drivers/net/wireless/realtek/rtw88/rtw8197g.c
++++ b/drivers/net/wireless/realtek/rtw88/rtw8197g.c
+@@ -1244,10 +1244,602 @@ static void rtw8197g_do_iqk(struct rtw_dev *rtwdev)
+ 			res[path].rx_x << 20 | res[path].rx_y << 8);
+ }
+ 
++/* DPK of the vendor driver (version 0x9). For each path the PA output is
++ * scanned through the TX loopback, the TX gain and the PGA are set for a gain
++ * loss in range, and the LMS engine fills the LUT of the predistortion. The
++ * watchdog then moves the power scaling factor with the temperature.
++ */
++#define RTW8197G_DPK_AGC_MAX	6
++#define RTW8197G_DPK_GL_NONE	0xa
++
++enum rtw8197g_dpk_shot {
++	DPK_SHOT_GL,		/* PA scan: gain loss */
++	DPK_SHOT_LMS,
++};
++
++static void rtw8197g_dpk_sel_path(struct rtw_dev *rtwdev, u8 path)
++{
++	rtw_write32_mask(rtwdev, REG_NCTL0_8197G, 0xf, 0x8 | path << 1);
++}
++
++static bool rtw8197g_is_cut_a(struct rtw_dev *rtwdev)
++{
++	return rtwdev->hal.cut_version == RTW_CHIP_VER_CUT_A;
++}
++
++static void rtw8197g_dpk_tx_pause(struct rtw_dev *rtwdev)
++{
++	u32 val;
++	u8 path;
++
++	rtw_write8(rtwdev, REG_TXPAUSE, 0xff);
++	/* HW TX stop */
++	rtw_write32_mask(rtwdev, 0x1e70, 0xf, 0x2);
++
++	for (path = 0; path < rtwdev->hal.rf_path_num; path++)
++		read_poll_timeout_atomic(rtw_read_rf, val, val != 0x2, 2, 5000,
++					 false, rtwdev, path, RF_MODE,
++					 0xf0000);
++}
++
++static void rtw8197g_dpk_macbb(struct rtw_dev *rtwdev)
++{
++	rtw8197g_dpk_tx_pause(rtwdev);
++
++	/* TSSI off */
++	rtw_write32_mask(rtwdev, 0x1e7c, BIT(30), 0x0);
++	rtw_write32_mask(rtwdev, 0x18a4, BIT(28), 0x0);
++	rtw_write32_mask(rtwdev, 0x41a4, BIT(28), 0x0);
++
++	rtw_write32_mask(rtwdev, 0x1e24, BIT(31), 0x0);
++	rtw_write32_mask(rtwdev, 0x1e28, 0xf, 0x3);
++	/* the RX path before the RF mode through the 3-wire ports */
++	rtw_write32_mask(rtwdev, REG_ANTMAP, 0xf0000, 0x3);
++	rtw_write32(rtwdev, 0x1808, 0x00050000);
++	rtw_write32(rtwdev, 0x4108, 0x00050000);
++	/* no CCK CCA on the test tone */
++	rtw_write32_mask(rtwdev, REG_CCKSB, 0x3, 0x2);
++	rtw_write32_mask(rtwdev, 0x1e24, BIT(17), 0x1);
++	/* CCA off */
++	rtw_write32_mask(rtwdev, 0x1d58, BIT(3), 0x1);
++	rtw_write32_mask(rtwdev, 0x1d58, 0xff0, 0xff);
++	rtw_write32_mask(rtwdev, 0x1864, BIT(31), 0x1);
++	rtw_write32_mask(rtwdev, 0x4164, BIT(31), 0x1);
++	rtw_write32_mask(rtwdev, REG_3WIRE, BIT(27), 0x1);
++	rtw_write32_mask(rtwdev, REG_3WIRE2, BIT(27), 0x1);
++	rtw_write32_mask(rtwdev, REG_3WIRE, 0x3, 0x0);
++	rtw_write32_mask(rtwdev, REG_3WIRE2, 0x3, 0x0);
++	/* RFE type 0 has no front end control to force */
++}
++
++static void rtw8197g_dpk_afe(struct rtw_dev *rtwdev, bool dpk)
++{
++	static const u32 afe_on[] = {0xB3001402, 0x06000141, 0x00000280, 0x0};
++	/* the normal mode settings the vendor driver leaves after DPK */
++	static const u32 afe_off[] = {
++		0x700b8041, 0x701f0044, 0x702f0044, 0x703f0044,
++		0x704f0044, 0x705b8041, 0x706f0044, 0x707b8041,
++		0x708b8041, 0x709b8041, 0x70ab8041, 0x70bb8041,
++		0x70cb8041, 0x70db8041, 0x70eb8041, 0x70fb8041,
++	};
++	u32 base[2] = {0x1800, 0x4100};
++	u8 path;
++	u32 i;
++
++	rtw_write32(rtwdev, 0x1c38, dpk ? 0xffffffff : 0xf7d5005e);
++
++	for (path = 0; path < rtwdev->hal.rf_path_num; path++) {
++		u32 anapar = base[path] + 0x30;
++
++		if (!dpk) {
++			for (i = 0; i < ARRAY_SIZE(afe_off); i++)
++				rtw_write32(rtwdev, anapar, afe_off[i]);
++			continue;
++		}
++
++		for (i = 0; i < ARRAY_SIZE(afe_on); i++)
++			rtw_write32(rtwdev, base[path] + 0x10 + i * 4, afe_on[i]);
++
++		rtw_write32(rtwdev, anapar, 0x700f0041);
++		for (i = 0; i <= 0xf; i++)
++			rtw_write32(rtwdev, anapar, 0x700f0041 | i << 20);
++	}
++}
++
++static void rtw8197g_dpk_pre_setting(struct rtw_dev *rtwdev)
++{
++	/* power scaling factors in SRAM 0 of the A cut */
++	static const u32 pwsf_a_cut[] = {
++		0x40caff81, 0x4080a183, 0x40516585, 0x40334087,
++		0x40202889, 0x4014198b, 0x400d108d, 0x40080a8f,
++		0x40050691, 0x40030493, 0x40020395, 0x40010297,
++		0x40010199, 0x4001019b, 0x4001019d, 0x4001019f,
++		0x00000000,
++	};
++	u8 path;
++	u32 i;
++
++	for (path = 0; path < rtwdev->hal.rf_path_num; path++) {
++		rtw_write32(rtwdev, REG_NCTL0_8197G, 0x8 | path << 1);
++		rtw_write32_mask(rtwdev, 0x1be8, 0x7f000000, 0x0);
++
++		if (rtw8197g_is_cut_a(rtwdev))
++			for (i = 0; i < ARRAY_SIZE(pwsf_a_cut); i++)
++				rtw_write32(rtwdev, 0x1bdc, pwsf_a_cut[i]);
++	}
++
++	rtw_write32(rtwdev, REG_NCTL0_8197G, 0x8);
++	rtw_write32(rtwdev, 0x1b90, 0x0105e018);
++}
++
++/* returns the TX gain the calibration starts with */
++static u8 rtw8197g_dpk_rf_setting(struct rtw_dev *rtwdev, u8 path)
++{
++	rtw_write_rf(rtwdev, path, RF_MODE, RFREG_MASK, 0x5001b);
++	/* coupling attenuation, TIA R1, test switch, TX loopback power */
++	rtw_write_rf(rtwdev, path, 0x85, 0x00f00, 0xa);
++	rtw_write_rf(rtwdev, path, 0x86, 0x0f000, 0x5);
++	rtw_write_rf(rtwdev, path, 0x85, 0x03000, 0x1);
++	rtw_write_rf(rtwdev, path, 0x80, BIT(0), 0x1);
++	/* TIA and PGA gain */
++	rtw_write_rf(rtwdev, path, 0xdf, BIT(16), 0x1);
++	rtw_write_rf(rtwdev, path, 0x83, 0x00030, 0x2);
++	rtw_write_rf(rtwdev, path, 0x8f, 0x0e000, 0x3);
++
++	return rtw_read_rf(rtwdev, path, RF_MODE, 0x1f);
++}
++
++static u8 rtw8197g_dpk_thermal_read(struct rtw_dev *rtwdev, u8 path)
++{
++	rtw_write_rf(rtwdev, path, 0x42, BIT(17), 0x1);
++	rtw_write_rf(rtwdev, path, 0x42, BIT(17), 0x0);
++	rtw_write_rf(rtwdev, path, 0x42, BIT(17), 0x1);
++	udelay(15);
++
++	return rtw_read_rf(rtwdev, path, 0xf6, 0x7e000);
++}
++
++static void rtw8197g_dpk_one_shot(struct rtw_dev *rtwdev,
++				  enum rtw8197g_dpk_shot shot)
++{
++	u32 val;
++
++	if (shot == DPK_SHOT_GL) {
++		rtw_write8(rtwdev, 0x1b84, 0xa0);
++		rtw_write8(rtwdev, 0x1b84, 0x20);
++		udelay(20);
++		rtw_write8(rtwdev, 0x1bd6, 0x12);
++	} else {
++		rtw_write8(rtwdev, 0x1b34, 0x02);
++		rtw_write8(rtwdev, 0x1b34, 0x00);
++		udelay(20);
++		rtw_write8(rtwdev, 0x1bd6, 0x0a);
++	}
++
++	if (read_poll_timeout(rtw_read32_mask, val, val, 20, 20000, false,
++			      rtwdev, 0x1bfc, BIT(0)))
++		rtw_dbg(rtwdev, RTW_DBG_RFK, "[DPK] %s one-shot timeout\n",
++			shot == DPK_SHOT_GL ? "PAS" : "LMS");
++}
++
++static void rtw8197g_dpk_timing_sync(struct rtw_dev *rtwdev, u8 path)
++{
++	u32 val, corr, dc_i, dc_q;
++
++	rtw_write8(rtwdev, 0x1b97, 0xf7);
++	/* bypass the predistortion, DPK sampling at 160 MHz */
++	rtw_write8(rtwdev, 0x1b23, 0x00);
++	rtw_write32_mask(rtwdev, 0x1bcc, BIT(16), 0x0);
++
++	rtw_write32(rtwdev, 0x1b88, 0x01b40000);
++	rtw_write32(rtwdev, 0x1b88, 0x00b40000);
++	udelay(50);
++
++	rtw_write8(rtwdev, 0x1bd6, 0x0c);
++	if (read_poll_timeout(rtw_read32_mask, val, val, 20, 20000, false,
++			      rtwdev, 0x1bfc, BIT(31)))
++		rtw_dbg(rtwdev, RTW_DBG_RFK, "[DPK] S%d sync timeout\n", path);
++
++	/* the vendor driver only reports these */
++	corr = rtw_read32_mask(rtwdev, 0x1bfc, 0xffff);
++	rtw_write8(rtwdev, 0x1bd6, 0x0d);
++	val = rtw_read32(rtwdev, 0x1bfc);
++	dc_i = u32_get_bits(val, 0x03ff0000);
++	dc_q = u32_get_bits(val, 0x000003ff);
++	rtw_dbg(rtwdev, RTW_DBG_RFK,
++		"[DPK] S%d corr idx/val %u/%u, DC I/Q %d/%d\n", path,
++		corr & 0xff, corr >> 8, sign_extend32(dc_i, 9),
++		sign_extend32(dc_q, 9));
++}
++
++/* gain or loss of the PA scan, in 0.01 dB */
++static s32 rtw8197g_dpk_get_gainloss(struct rtw_dev *rtwdev, bool gain)
++{
++	s32 val;
++
++	if (gain) {
++		rtw_write8(rtwdev, 0x1bd6, 0x02);
++		val = rtw_read32_mask(rtwdev, 0x1bfc, 0x00003fff);
++	} else {
++		rtw_write8(rtwdev, 0x1bd6, 0x01);
++		val = rtw_read32_mask(rtwdev, 0x1bfc, 0x3fff0000);
++	}
++
++	return (6 * sign_extend32(val, 13) * 100) >> 9;
++}
++
++/* returns true when the PA scan is out of range */
++static bool rtw8197g_dpk_pas_check(struct rtw_dev *rtwdev, u8 path)
++{
++	s32 loss = rtw8197g_dpk_get_gainloss(rtwdev, false);
++	s32 gain = rtw8197g_dpk_get_gainloss(rtwdev, true);
++	bool fail = false;
++
++	if (loss - gain > 400) {
++		rtw_dbg(rtwdev, RTW_DBG_RFK, "[DPK] S%d gain loss > 4 dB\n",
++			path);
++		fail = true;
++	}
++
++	rtw_write8(rtwdev, 0x1bd6, 0x02);
++	if (rtw_read32_mask(rtwdev, 0x1bfc, BIT(24)) && loss < 1400) {
++		rtw_dbg(rtwdev, RTW_DBG_RFK, "[DPK] S%d PA scan < -14 dB\n",
++			path);
++		fail = true;
++	}
++
++	return fail;
++}
++
++static u8 rtw8197g_dpk_gainloss_idx(struct rtw_dev *rtwdev)
++{
++	rtw_write32_mask(rtwdev, 0x1bcc, BIT(26), 0x1);
++	rtw_write32(rtwdev, 0x1b90, 0x0105e038);
++	rtw_write8(rtwdev, 0x1bd6, 0x06);
++
++	return rtw_read32_mask(rtwdev, 0x1bfc, 0xf);
++}
++
++/* the PGA must be 3 when this starts */
++static u8 rtw8197g_dpk_auto_pga(struct rtw_dev *rtwdev, u8 path)
++{
++	u8 pga;
++
++	/* PA scan from big to small, PGA auto gain for -6 dB < gain <= -4 dB */
++	rtw_write32_mask(rtwdev, 0x1bcc, BIT(20), 0x1);
++	rtw_write8(rtwdev, 0x1bef, 0xa2);
++	rtw_write8(rtwdev, 0x1b84, 0x00);
++	rtw8197g_dpk_one_shot(rtwdev, DPK_SHOT_GL);
++
++	rtw_write8(rtwdev, 0x1bd6, 0x02);
++	pga = rtw_read32_mask(rtwdev, 0x1bfc, GENMASK(18, 16));
++	rtw_write_rf(rtwdev, path, 0x8f, 0x0e000, pga);
++
++	rtw_write8(rtwdev, 0x1bef, 0x22);
++	rtw8197g_dpk_one_shot(rtwdev, DPK_SHOT_GL);
++
++	return pga;
++}
++
++/* The arithmetic of the vendor driver, in u8 */
++static u8 rtw8197g_dpk_adjust_pga(struct rtw_dev *rtwdev, u8 path, u8 txagc,
++				  u8 pga, u8 gl_idx)
++{
++	u8 offset;
++
++	txagc = txagc - RTW8197G_DPK_GL_NONE + gl_idx;
++	offset = (RTW8197G_DPK_GL_NONE - gl_idx) >> 1;
++
++	if (offset > 0 && pga != 0x7) {
++		/* the PGA has no step 4 */
++		if (pga == 0x3 || pga + offset > 0x3)
++			pga = pga + offset + 1;
++		else
++			pga = pga + offset;
++	}
++	if (pga > 0x7)
++		pga = 0x7;
++
++	rtw_write_rf(rtwdev, path, RF_MODE, 0x1f, txagc);
++	rtw_write_rf(rtwdev, path, 0x8f, 0x0e000, pga);
++	udelay(5);
++
++	return txagc;
++}
++
++/* move the TX gain until the gain loss is in range, the PGA the other way */
++static u8 rtw8197g_dpk_pas_agc(struct rtw_dev *rtwdev, u8 path, u8 txagc)
++{
++	u8 pga, gl_idx, agc_cnt = 0;
++	bool limited;
++	s32 gain;
++
++	pga = rtw8197g_dpk_auto_pga(rtwdev, path);
++	gl_idx = rtw8197g_dpk_gainloss_idx(rtwdev);
++
++	while (true) {
++		gain = rtw8197g_dpk_get_gainloss(rtwdev, true);
++		rtw_dbg(rtwdev, RTW_DBG_RFK,
++			"[DPK] S%d AGC %u: TXAGC 0x%x PGA 0x%x GL idx 0x%x gain %d\n",
++			path, agc_cnt, txagc, pga, gl_idx, gain);
++
++		if (gl_idx >= 0x4 && gl_idx != RTW8197G_DPK_GL_NONE)
++			break;
++		if (++agc_cnt >= RTW8197G_DPK_AGC_MAX)
++			break;
++
++		limited = false;
++		if (gl_idx == RTW8197G_DPK_GL_NONE) {
++			/* too little gain loss: more TX gain, less PGA */
++			if (txagc == 0x1f)
++				break;
++			txagc += 0x1f - txagc == 0x1 ? 1 : 2;
++			rtw_write_rf(rtwdev, path, RF_MODE, 0x1f, txagc);
++			udelay(5);
++
++			if (pga == 0x0 || gain <= -600)
++				limited = true;
++			else
++				pga -= pga == 0x5 ? 2 : 1;
++		} else {
++			/* too much gain loss: less TX gain, more PGA */
++			if (txagc == 0x00)
++				break;
++			txagc -= txagc == 0x1 ? 1 : 2;
++			rtw_write_rf(rtwdev, path, RF_MODE, 0x1f, txagc);
++			udelay(5);
++
++			if (pga == 0x7 || gain >= -400)
++				limited = true;
++			else
++				pga += pga == 0x3 ? 2 : 1;
++		}
++
++		if (!limited) {
++			rtw_write_rf(rtwdev, path, 0x8f, 0x0e000, pga);
++			udelay(5);
++		}
++
++		rtw8197g_dpk_one_shot(rtwdev, DPK_SHOT_GL);
++		gl_idx = rtw8197g_dpk_gainloss_idx(rtwdev);
++	}
++
++	return rtw8197g_dpk_adjust_pga(rtwdev, path, txagc, pga, gl_idx);
++}
++
++static u8 rtw8197g_dpk_gainloss(struct rtw_dev *rtwdev, u8 path)
++{
++	struct rtw_dpk_info *dpk_info = &rtwdev->dm_info.dpk_info;
++	u8 txagc;
++
++	txagc = rtw8197g_dpk_rf_setting(rtwdev, path);
++	dpk_info->thermal_dpk[path] = rtw8197g_dpk_thermal_read(rtwdev, path);
++	fsleep(1000);
++
++	rtw8197g_dpk_sel_path(rtwdev, path);
++	/* test pattern for the bandwidth: RF 0x18[11:10] 3 = 20M, 2 = 40M */
++	rtw_write32(rtwdev, 0x1b80, 0x10000000 | (dpk_info->dpk_bw - 2) << 25);
++	rtw8197g_dpk_timing_sync(rtwdev, path);
++
++	return rtw8197g_dpk_pas_agc(rtwdev, path, txagc);
++}
++
++static void rtw8197g_dpk_lms(struct rtw_dev *rtwdev, u8 path)
++{
++	/* no test pattern, predistortion on */
++	rtw_write8(rtwdev, 0x1b83, 0x00);
++	rtw_write8(rtwdev, 0x1b23, 0x01);
++	rtw_write32(rtwdev, 0x1b90, 0x020df0b8);
++	rtw_write8(rtwdev, 0x1bca, 0x00);
++	rtw_write32_mask(rtwdev, 0x1bcc, 0x3f, 0x3f);
++	rtw_write32_mask(rtwdev, 0x1bcc, MASKHWORD, 0x0385);
++
++	rtw8197g_dpk_one_shot(rtwdev, DPK_SHOT_LMS);
++	rtw_dbg(rtwdev, RTW_DBG_RFK, "[DPK] S%d LMS fail bit %u\n", path,
++		rtw_read32_mask(rtwdev, 0x1bfc, BIT(1)));
++
++	rtw_write32_mask(rtwdev, 0x1bcc, 0x3f, 0x00);
++}
++
++/* returns true when the PA scan failed */
++static bool rtw8197g_dpk_by_path(struct rtw_dev *rtwdev, u8 path, u8 txagc)
++{
++	u8 pwsf_idx = (txagc - 0x19) & 0x1f;
++	bool fail;
++
++	rtw8197g_dpk_sel_path(rtwdev, path);
++	if (rtw8197g_is_cut_a(rtwdev))
++		rtw_write32_mask(rtwdev, 0x1be8, 0x1f000000, pwsf_idx);
++	else
++		rtw_write32_mask(rtwdev, 0x1be8, 0x7c000000, pwsf_idx);
++
++	rtw8197g_dpk_one_shot(rtwdev, DPK_SHOT_GL);
++	fail = rtw8197g_dpk_pas_check(rtwdev, path);
++	udelay(10);
++
++	rtw8197g_dpk_lms(rtwdev, path);
++
++	/* predistortion off, LUT from SRAM */
++	rtw_write8(rtwdev, 0x1b23, 0x03);
++	rtw_write32(rtwdev, 0x1b90, 0x0105e018);
++	rtw_write32_mask(rtwdev, 0x1bcc, MASKHWORD, 0x1902);
++
++	return fail;
++}
++
++/* the first LUT entries must not be 4 dB below full scale */
++static bool rtw8197g_dpk_lut_ok(struct rtw_dev *rtwdev, u8 path)
++{
++	static const u8 table_sel[] = {0x22, 0x23};	/* even, odd */
++	u32 val, i_val, q_val;
++	u32 i;
++
++	rtw8197g_dpk_sel_path(rtwdev, path);
++	rtw_write8(rtwdev, 0x1b08, 0x80);
++
++	for (i = 0; i < ARRAY_SIZE(table_sel); i++) {
++		rtw_write8(rtwdev, 0x1bd6, table_sel[i]);
++		rtw_write32(rtwdev, 0x1bdc, 0xc0000081);
++		rtw_read32(rtwdev, 0x1bdc);
++		val = rtw_read32(rtwdev, 0x1bfc);
++
++		i_val = u32_get_bits(val, 0x003ff800);
++		q_val = val & 0x7ff;
++		if (q_val & 0x400)
++			q_val = 0x800 - q_val;
++
++		if (i_val * i_val + q_val * q_val < 0x197a9) {
++			rtw_dbg(rtwdev, RTW_DBG_RFK,
++				"[DPK] S%d LUT < -4 dB, I 0x%x Q 0x%x\n",
++				path, i_val, q_val);
++			return false;
++		}
++	}
++
++	rtw_write32(rtwdev, 0x1bdc, 0x0);
++
++	return true;
++}
++
++static void rtw8197g_dpk_on(struct rtw_dev *rtwdev, u8 path)
++{
++	rtw8197g_dpk_sel_path(rtwdev, path);
++	rtw_write8(rtwdev, 0x1b97, 0x77);
++	rtw_write8(rtwdev, 0x1bcb, 0x00);
++	rtw_write32_mask(rtwdev, 0x1b20, BIT(25) | BIT(24), 0x1);
++	/* gain scaling from the LMS result */
++	rtw_write32_mask(rtwdev, 0x1be8, BIT(16), 0x0);
++}
++
++static void rtw8197g_dpk_calibrate(struct rtw_dev *rtwdev, u8 path)
++{
++	struct rtw_dpk_info *dpk_info = &rtwdev->dm_info.dpk_info;
++	u8 txagc;
++	bool fail;
++
++	txagc = rtw8197g_dpk_gainloss(rtwdev, path);
++	dpk_info->dpk_txagc[path] = txagc;
++	fsleep(1000);
++
++	fail = rtw8197g_dpk_by_path(rtwdev, path, txagc);
++	if (fail || !rtw8197g_dpk_lut_ok(rtwdev, path))
++		return;
++
++	dpk_info->pwsf[path] = rtw_read32_mask(rtwdev, 0x1be8,
++					       rtw8197g_is_cut_a(rtwdev) ?
++					       0x1f000000 : 0x7f000000);
++	dpk_info->pre_pwsf[path] = dpk_info->pwsf[path];
++	set_bit(path, dpk_info->dpk_path_ok);
++	rtw8197g_dpk_on(rtwdev, path);
++}
++
++static void rtw8197g_do_dpk(struct rtw_dev *rtwdev)
++{
++	static const u32 bb_regs[] = {
++		0x520, 0x824, 0x180c, 0x410c, 0x1d58, 0x1a00, 0x1864, 0x4164,
++		0x1d70, 0x1e70, 0x18a4, 0x41a4, 0x1e7c, 0x183c, 0x1840, 0x1844,
++		0x413c, 0x4140, 0x4144,
++	};
++	static const u32 rf_regs[] = {0xdf, 0x8f};
++	struct rtw_dpk_info *dpk_info = &rtwdev->dm_info.dpk_info;
++	u32 rf[ARRAY_SIZE(rf_regs)][RTW_RF_PATH_MAX];
++	u32 bb[ARRAY_SIZE(bb_regs)];
++	u8 path_num = rtwdev->hal.rf_path_num;
++	u32 rf18;
++	u8 path;
++	u32 i;
++
++	for (i = 0; i < ARRAY_SIZE(bb_regs); i++)
++		bb[i] = rtw_read32(rtwdev, bb_regs[i]);
++	for (i = 0; i < ARRAY_SIZE(rf_regs); i++)
++		for (path = 0; path < path_num; path++)
++			rf[i][path] = rtw_read_rf(rtwdev, path, rf_regs[i],
++						  RFREG_MASK);
++
++	rf18 = rtw_read_rf(rtwdev, RF_PATH_A, 0x18, RFREG_MASK);
++	dpk_info->dpk_ch = rf18 & 0xff;
++	dpk_info->dpk_bw = u32_get_bits(rf18, 0xc00);
++
++	rtw8197g_dpk_macbb(rtwdev);
++	rtw8197g_dpk_pre_setting(rtwdev);
++	rtw8197g_dpk_afe(rtwdev, true);
++
++	bitmap_zero(dpk_info->dpk_path_ok, DPK_RF_PATH_NUM);
++	for (path = 0; path < path_num; path++) {
++		dpk_info->pwsf[path] = 0;
++		rtw8197g_dpk_calibrate(rtwdev, path);
++	}
++
++	rtw8197g_dpk_afe(rtwdev, false);
++
++	for (i = 0; i < ARRAY_SIZE(rf_regs); i++)
++		for (path = 0; path < path_num; path++)
++			rtw_write_rf(rtwdev, path, rf_regs[i], RFREG_MASK,
++				     rf[i][path]);
++
++	/* a change of 0x1d70 (restored below) makes the IGI take effect */
++	rtw_write32(rtwdev, 0x1d70, 0x50505050);
++	for (i = 0; i < ARRAY_SIZE(bb_regs); i++)
++		rtw_write32(rtwdev, bb_regs[i], bb[i]);
++	rtw_write32_mask(rtwdev, 0x1e24, BIT(31), 0x1);
++
++	for (path = 0; path < path_num; path++) {
++		if (!test_bit(path, dpk_info->dpk_path_ok))
++			continue;
++
++		/* predistortion enabled */
++		rtw8197g_dpk_sel_path(rtwdev, path);
++		rtw_write32_mask(rtwdev, 0x1b20, BIT(25), 0x0);
++		ewma_thermal_init(&dpk_info->avg_thermal[path]);
++		ewma_thermal_add(&dpk_info->avg_thermal[path],
++				 dpk_info->thermal_dpk[path]);
++	}
++
++	for (path = 0; path < path_num; path++)
++		rtw_dbg(rtwdev, RTW_DBG_RFK,
++			"[DPK] S%d %s: ch %u TXAGC 0x%x pwsf 0x%x thermal 0x%x\n",
++			path, test_bit(path, dpk_info->dpk_path_ok) ?
++			"ok" : "fail", dpk_info->dpk_ch,
++			dpk_info->dpk_txagc[path], dpk_info->pwsf[path],
++			dpk_info->thermal_dpk[path]);
++}
++
++/* the A cut has no tracking */
++static void rtw8197g_dpk_track(struct rtw_dev *rtwdev)
++{
++	struct rtw_dpk_info *dpk_info = &rtwdev->dm_info.dpk_info;
++	u8 path, thermal, pwsf;
++
++	if (rtw8197g_is_cut_a(rtwdev))
++		return;
++
++	for (path = 0; path < rtwdev->hal.rf_path_num; path++) {
++		if (!test_bit(path, dpk_info->dpk_path_ok))
++			continue;
++
++		thermal = rtw8197g_dpk_thermal_read(rtwdev, path);
++		ewma_thermal_add(&dpk_info->avg_thermal[path], thermal);
++		thermal = ewma_thermal_read(&dpk_info->avg_thermal[path]);
++
++		pwsf = (dpk_info->pwsf[path] + thermal -
++			dpk_info->thermal_dpk[path]) & 0x7f;
++		if (pwsf == dpk_info->pre_pwsf[path])
++			continue;
++
++		rtw8197g_dpk_sel_path(rtwdev, path);
++		rtw_write32_mask(rtwdev, 0x1be8, 0x7f000000, pwsf);
++		dpk_info->pre_pwsf[path] = pwsf;
++		rtw_dbg(rtwdev, RTW_DBG_RFK,
++			"[DPK] S%d thermal 0x%x (0x%x at DPK), pwsf 0x%x\n",
++			path, thermal, dpk_info->thermal_dpk[path], pwsf);
++	}
++}
++
+ static void rtw8197g_phy_calibration(struct rtw_dev *rtwdev)
+ {
+-	/* TSSI and DPK of the vendor driver are not ported yet */
++	/* TSSI of the vendor driver is not ported yet */
+ 	rtw8197g_do_iqk(rtwdev);
++	rtw8197g_do_dpk(rtwdev);
+ }
+ 
+ static void rtw8197g_pwr_track(struct rtw_dev *rtwdev)
+@@ -1734,6 +2326,7 @@ static const struct rtw_chip_ops rtw8197g_ops = {
+ 	.phy_calibration	= rtw8197g_phy_calibration,
+ 	.cck_pd_set		= rtw8197g_phy_cck_pd_set,
+ 	.pwr_track		= rtw8197g_pwr_track,
++	.dpk_track		= rtw8197g_dpk_track,
+ 	.adaptivity_init	= rtw8197g_adaptivity_init,
+ 	.adaptivity		= rtw8197g_adaptivity,
+ 	.cfo_init		= rtw8197g_cfo_init,
