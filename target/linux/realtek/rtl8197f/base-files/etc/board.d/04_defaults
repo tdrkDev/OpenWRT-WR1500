@@ -1,0 +1,27 @@
+. /lib/functions.sh
+. /lib/functions/uci-defaults.sh
+
+board=$(board_name)
+
+board_config_update
+
+case $board in
+cudy,wr1500)
+	# Wi-Fi names, password and country from the factory data, as the
+	# vendor firmware uses them
+	bdinfo=$(find_mtd_part bdinfo)
+	mac=$(cudy-bdinfo-read -i "$bdinfo" -k mac)
+	pin=$(cudy-bdinfo-read -i "$bdinfo" -k pin)
+	country=$(cudy-bdinfo-read -i "$bdinfo" -k country)
+	if [ ${#mac} -eq 12 ] && [ ${#pin} -ge 8 ]; then
+		suffix=${mac#${mac%????}}
+		ucidef_set_wireless 2g "Cudy-$suffix" sae-mixed "$pin"
+		ucidef_set_wireless 5g "Cudy-$suffix-5G" sae-mixed "$pin"
+	fi
+	[ -n "$country" ] && ucidef_set_country "$country"
+	;;
+esac
+
+board_config_flush
+
+exit 0
