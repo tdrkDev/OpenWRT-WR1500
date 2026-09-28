@@ -1,0 +1,158 @@
+From: Roman Rikhter <teledurak@gmail.com>
+Subject: [PATCH] wifi: rtw89: pci: don't claim interrupts while stopped
+
+The interrupt is level triggered on some hosts, and shared. While the
+device is stopped, the handler claims every interrupt without masking
+anything, so a device that keeps its interrupt asserted, for example
+after it lost its link, calls the handler again as soon as it returns,
+and the CPU does nothing else. Return IRQ_NONE instead: the core then
+disables a line that nobody handles, and the system keeps running.
+
+The RTL8832BR also enables interrupts that nothing acts on but a NAPI
+poll: DMA stuck on TX and on RX, and GPIO18, through the HS1 indicator.
+One that stays pending keeps the interrupt thread and NAPI busy. The
+RTL8832BR is found in routers, and the vendor driver for it leaves them
+off, together with RX part 1, which the packet mode doesn't use. Give
+the RTL8832BR its own PCI info, with a flag that does the same for
+normal operation; the low power and recovery masks stay.
+
+Signed-off-by: Roman Rikhter <teledurak@gmail.com>
+---
+diff --git drivers/net/wireless/realtek/rtw89/pci.c drivers/net/wireless/realtek/rtw89/pci.c
+index 54e605d..3460e7e 100644
+--- a/drivers/net/wireless/realtek/rtw89/pci.c
++++ b/drivers/net/wireless/realtek/rtw89/pci.c
+@@ -1122,10 +1122,11 @@ static irqreturn_t rtw89_pci_interrupt_handler(int irq, void *dev)
+ 	spin_lock_irqsave(&rtwpci->irq_lock, flags);
+ 
+ 	/* If interrupt event is on the road, it is still trigger interrupt
+-	 * even we have done pci_stop() to turn off IMR.
++	 * even we have done pci_stop() to turn off IMR. Don't claim it, so
++	 * that an interrupt that stays asserted gets the line disabled.
+ 	 */
+ 	if (unlikely(!rtwpci->running)) {
+-		irqret = IRQ_HANDLED;
++		irqret = IRQ_NONE;
+ 		goto exit;
+ 	}
+ 
+@@ -4212,6 +4213,7 @@ static void rtw89_pci_recovery_intr_mask_v1(struct rtw89_dev *rtwdev)
+ static void rtw89_pci_default_intr_mask_v1(struct rtw89_dev *rtwdev)
+ {
+ 	struct rtw89_pci *rtwpci = (struct rtw89_pci *)rtwdev->priv;
++	const struct rtw89_pci_info *info = rtwdev->pci_info;
+ 
+ 	rtwpci->ind_intrs = B_AX_HCI_AXIDMA_INT_EN |
+ 			    B_AX_HS1ISR_IND_INT_EN |
+@@ -4225,6 +4227,20 @@ static void rtw89_pci_default_intr_mask_v1(struct rtw89_dev *rtwdev)
+ 			   B_AX_RDU_INT_EN |
+ 			   B_AX_RPQBD_FULL_INT_EN;
+ 	rtwpci->intrs[1] = B_AX_GPIO18_INT_EN;
++
++	/*
++	 * Nothing acts on the DMA stuck and GPIO interrupts but a NAPI poll,
++	 * so one that stays pending keeps the handlers busy. Chips found in
++	 * routers leave them off, as their vendor driver does, and RX part 1
++	 * isn't used in packet mode.
++	 */
++	if (info->min_intr_mask) {
++		rtwpci->ind_intrs &= ~B_AX_HS1ISR_IND_INT_EN;
++		rtwpci->intrs[0] &= ~(B_AX_TXDMA_STUCK_INT_EN |
++				      B_AX_RXP1DMA_INT_EN |
++				      B_AX_RXDMA_STUCK_INT_EN);
++		rtwpci->intrs[1] = 0;
++	}
+ }
+ 
+ static void rtw89_pci_low_power_intr_mask_v1(struct rtw89_dev *rtwdev)
+diff --git drivers/net/wireless/realtek/rtw89/pci.h drivers/net/wireless/realtek/rtw89/pci.h
+index a43d9e4..57bc504 100644
+--- a/drivers/net/wireless/realtek/rtw89/pci.h
++++ b/drivers/net/wireless/realtek/rtw89/pci.h
+@@ -1411,6 +1411,7 @@ struct rtw89_pci_info {
+ 	bool check_rx_tag;
+ 	bool no_rxbd_fs;
+ 	bool group_bd_addr;
++	bool min_intr_mask;
+ 	u32 rpp_fmt_size;
+ 
+ 	u32 init_cfg_reg;
+diff --git drivers/net/wireless/realtek/rtw89/rtw8852ce.c drivers/net/wireless/realtek/rtw89/rtw8852ce.c
+index 6910ab2..1eef34d 100644
+--- a/drivers/net/wireless/realtek/rtw89/rtw8852ce.c
++++ b/drivers/net/wireless/realtek/rtw89/rtw8852ce.c
+@@ -76,6 +76,65 @@ static const struct rtw89_pci_info rtw8852c_pci_info = {
+ 	.ssid_quirks		= NULL,
+ };
+ 
++static const struct rtw89_pci_info rtw8832br_pci_info = {
++	.gen_def		= &rtw89_pci_gen_ax,
++	.isr_def		= &rtw89_pci_isr_ax,
++	.txbd_trunc_mode	= MAC_AX_BD_TRUNC,
++	.rxbd_trunc_mode	= MAC_AX_BD_TRUNC,
++	.rxbd_mode		= MAC_AX_RXBD_PKT,
++	.tag_mode		= MAC_AX_TAG_MULTI,
++	.tx_burst		= MAC_AX_TX_BURST_V1_256B,
++	.rx_burst		= MAC_AX_RX_BURST_V1_128B,
++	.wd_dma_idle_intvl	= MAC_AX_WD_DMA_INTVL_256NS,
++	.wd_dma_act_intvl	= MAC_AX_WD_DMA_INTVL_256NS,
++	.multi_tag_num		= MAC_AX_TAG_NUM_8,
++	.lbc_en			= MAC_AX_PCIE_ENABLE,
++	.lbc_tmr		= MAC_AX_LBC_TMR_2MS,
++	.autok_en		= MAC_AX_PCIE_DISABLE,
++	.io_rcy_en		= MAC_AX_PCIE_ENABLE,
++	.io_rcy_tmr		= MAC_AX_IO_RCY_ANA_TMR_6MS,
++	.rx_ring_eq_is_full	= false,
++	.check_rx_tag		= false,
++	.no_rxbd_fs		= false,
++	.group_bd_addr		= false,
++	.min_intr_mask		= true,
++	.rpp_fmt_size		= sizeof(struct rtw89_pci_rpp_fmt),
++
++	.init_cfg_reg		= R_AX_HAXI_INIT_CFG1,
++	.txhci_en_bit		= B_AX_TXHCI_EN_V1,
++	.rxhci_en_bit		= B_AX_RXHCI_EN_V1,
++	.rxbd_mode_bit		= B_AX_RXBD_MODE_V1,
++	.exp_ctrl_reg		= R_AX_HAXI_EXP_CTRL,
++	.max_tag_num_mask	= B_AX_MAX_TAG_NUM_V1_MASK,
++	.rxbd_rwptr_clr_reg	= R_AX_RXBD_RWPTR_CLR_V1,
++	.txbd_rwptr_clr2_reg	= R_AX_TXBD_RWPTR_CLR2_V1,
++	.dma_io_stop		= {R_AX_HAXI_INIT_CFG1, B_AX_STOP_AXI_MST},
++	.dma_stop1		= {R_AX_HAXI_DMA_STOP1, B_AX_TX_STOP1_MASK},
++	.dma_stop2		= {R_AX_HAXI_DMA_STOP2, B_AX_TX_STOP2_ALL},
++	.dma_busy1		= {R_AX_HAXI_DMA_BUSY1, DMA_BUSY1_CHECK},
++	.dma_busy2_reg		= R_AX_HAXI_DMA_BUSY2,
++	.dma_busy3_reg		= R_AX_HAXI_DMA_BUSY3,
++
++	.rpwm_addr		= R_AX_PCIE_HRPWM_V1,
++	.cpwm_addr		= R_AX_PCIE_CRPWM,
++	.mit_addr		= R_AX_INT_MIT_RX_V1,
++	.wp_sel_addr		= R_AX_WP_ADDR_H_SEL0_3,
++	.tx_dma_ch_mask		= 0,
++	.bd_idx_addr_low_power	= &rtw8852c_bd_idx_addr_low_power,
++	.dma_addr_set		= &rtw89_pci_ch_dma_addr_set_v1,
++	.bd_ram_table		= &rtw89_bd_ram_table_dual,
++
++	.ltr_set		= rtw89_pci_ltr_set_v1,
++	.fill_txaddr_info	= rtw89_pci_fill_txaddr_info_v1,
++	.parse_rpp		= rtw89_pci_parse_rpp,
++	.config_intr_mask	= rtw89_pci_config_intr_mask_v1,
++	.enable_intr		= rtw89_pci_enable_intr_v1,
++	.disable_intr		= rtw89_pci_disable_intr_v1,
++	.recognize_intrs	= rtw89_pci_recognize_intrs_v1,
++
++	.ssid_quirks		= NULL,
++};
++
+ static const struct dmi_system_id rtw8852c_pci_quirks[] = {
+ 	{
+ 		.ident = "Dell Inc. Vostro 16 5640",
+@@ -114,7 +173,7 @@ static const struct rtw89_driver_info rtw89_8832br_info = {
+ 	.quirks = NULL,
+ 	.dev_id_quirks = 0,
+ 	.bus = {
+-		.pci = &rtw8852c_pci_info,
++		.pci = &rtw8832br_pci_info,
+ 	},
+ };
+ 
