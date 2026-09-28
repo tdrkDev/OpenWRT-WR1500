@@ -1,0 +1,399 @@
+From: Roman Rikhter <teledurak@gmail.com>
+Subject: [PATCH] net: dsa: realtek: rtl8365mb: keep PVID 0 on VLAN-unaware ports
+
+The driver sets configure_vlan_while_not_filtering, so DSA adds the
+bridge default_pvid VLAN to the user ports even while the bridge is
+VLAN-unaware. port_vlan_add() programs it as the hardware PVID whether
+or not the port is filtering, and disabling VLAN filtering does not
+reset it. All VLANs use IVL, so the switch classifies the untagged
+frames of a VLAN-unaware bridge port to VID 1, and both learns and looks
+up their addresses under VID 1.
+
+DSA, however, installs the FDB and MDB entries of a VLAN-unaware bridge
+with VID 0 and expects all packets to match them, whatever their VLAN
+(see Documentation/networking/dsa/dsa.rst). This includes the host
+addresses that assisted learning installs on the CPU port for stations
+behind foreign bridge ports, such as Wi-Fi clients. Frames from a switch
+port to such a station are looked up under VID 1, miss the {MAC, VID 0}
+entry and are flooded as unknown unicast to every other port of the
+bridge. On a router that bridges its access point with the LAN ports, a
+stream from a wired host to a Wi-Fi client is copied to all other LAN
+ports.
+
+Do what mt7530 does: keep PVID 0 on VLAN-unaware ports, program the
+bridge PVID only while the port is filtering, and set up VID 0 with IVL
+so that the lookups of these ports hit the VID 0 entries.
+port_vlan_add() and port_vlan_del() now record the bridge PVID of the
+port and only change the hardware PVID of a VLAN-aware port.
+port_vlan_filtering() programs the recorded PVID when filtering is
+enabled and restores PVID 0 when it is disabled. DSA updates the
+filtering state of the port only after port_vlan_filtering() returns,
+so that function uses its vlan_filtering argument.
+
+Standalone ports never get a PVID and already use VID 0, so they are
+not affected. On the RTL8367D family, which has no EFID, standalone
+ports and a VLAN-unaware bridge now share the VID 0 database. Port
+isolation still confines their traffic, and a lookup hit on an isolated
+port is treated as unknown (see rtl8365mb_switch_init()).
+
+On the RTL8367D this is not enough to stop the flooding: the next patch
+keys VID 0 with SVL there. The RTL8367C family was not tested.
+
+Fixes: 9da2c8672f77 ("net: dsa: realtek: rtl8365mb: add VLAN support")
+Signed-off-by: Roman Rikhter <teledurak@gmail.com>
+---
+--- a/drivers/net/dsa/realtek/rtl8365mb_main.c
++++ b/drivers/net/dsa/realtek/rtl8365mb_main.c
+@@ -889,6 +889,9 @@
+  *         access via rtl8365mb_get_stats64
+  * @stats_lock: protect the stats structure during read/update
+  * @mib_work: delayed work for polling MIB counters
++ * @bridge_pvid: PVID of the port in the bridge VLAN configuration, or 0 if
++ *               none. It is only programmed into the switch while the port is
++ *               VLAN-aware. Protected by &realtek_priv.vlan_lock.
+  */
+ struct rtl8365mb_port {
+ 	struct realtek_priv *priv;
+@@ -896,6 +899,7 @@
+ 	struct rtnl_link_stats64 stats;
+ 	spinlock_t stats_lock;
+ 	struct delayed_work mib_work;
++	u16 bridge_pvid;
+ };
+ 
+ /**
+@@ -2082,33 +2086,44 @@
+ 	enum rtl8365mb_frame_ingress accepted_frame, prev_accepted_frame;
+ 	enum rtl8365mb_vlan_egress_mode mode;
+ 	struct realtek_priv *priv = ds->priv;
++	struct rtl8365mb *mb = priv->chip_data;
++	u16 pvid_vid, prev_pvid_vid;
+ 	u32 configured_ports = 0;
+ 	struct dsa_port *dp;
+-	u16 pvid_vid;
+ 	int ret;
+ 
+ 	dev_dbg(priv->dev, "port %d: %s VLAN filtering\n", port,
+ 		vlan_filtering ? "enable" : "disable");
+ 
++	mutex_lock(&priv->vlan_lock);
++
+ 	ret = rtl8365mb_vlan_port_get_framefilter(priv, port,
+ 						  &prev_accepted_frame);
+ 	if (ret) {
+ 		NL_SET_ERR_MSG_MOD(extack,
+ 				   "Failed to get current framefilter");
+-		return ret;
++		goto out_unlock;
+ 	}
+ 
+-	/* While filtering, only accepts untagged frames if PVID is enabled */
++	ret = rtl8365mb_vlan_port_get_pvid(priv, port, &prev_pvid_vid);
++	if (ret)
++		goto out_unlock;
++
++	/* The bridge PVID is only programmed while filtering. A VLAN-unaware
++	 * port uses PVID 0 instead, as DSA installs its FDB and MDB entries
++	 * with VID 0. See rtl8365mb_vlan_setup().
++	 *
++	 * While filtering, only accepts untagged frames if PVID is enabled.
++	 */
+ 	if (vlan_filtering) {
+-		ret = rtl8365mb_vlan_port_get_pvid(priv, port, &pvid_vid);
+-		if (ret)
+-			return ret;
++		pvid_vid = mb->ports[port].bridge_pvid;
+ 
+ 		if (pvid_vid)
+ 			accepted_frame = RTL8365MB_FRAME_TYPE_ANY_FRAME;
+ 		else
+ 			accepted_frame = RTL8365MB_FRAME_TYPE_TAGGED_ONLY;
+ 	} else {
++		pvid_vid = 0;
+ 		accepted_frame = RTL8365MB_FRAME_TYPE_ANY_FRAME;
+ 	}
+ 
+@@ -2118,7 +2133,7 @@
+ 	 */
+ 	ret = rtl8365mb_port_set_ingress_filtering(priv, port, vlan_filtering);
+ 	if (ret)
+-		return ret;
++		goto out_unlock;
+ 
+ 	/* However, we also enable/disable egress filtering because the switch
+ 	 * still consider the egress interface VLAN membership to forward the
+@@ -2135,14 +2150,24 @@
+ 		configured_ports |= BIT(dp->index);
+ 	}
+ 
+-	if (accepted_frame != prev_accepted_frame) {
+-		ret = rtl8365mb_vlan_port_set_framefilter(priv, port,
+-							  accepted_frame);
+-		if (ret) {
+-			NL_SET_ERR_MSG_MOD(extack,
+-					   "Failed to set port framefilter");
++	if (pvid_vid != prev_pvid_vid) {
++		if (pvid_vid)
++			ret = rtl8365mb_vlan_pvid_port_set(ds, port, pvid_vid,
++							   extack);
++		else
++			ret = rtl8365mb_vlan_pvid_port_clear(ds, port,
++							     prev_pvid_vid);
++		if (ret)
+ 			goto undo_transparent;
+-		}
++	}
++
++	/* Setting or clearing the PVID also changes the accepted frame type,
++	 * so always set it here.
++	 */
++	ret = rtl8365mb_vlan_port_set_framefilter(priv, port, accepted_frame);
++	if (ret) {
++		NL_SET_ERR_MSG_MOD(extack, "Failed to set port framefilter");
++		goto undo_set_pvid;
+ 	}
+ 
+ 	/* When VLAN filtering is disabled, preserve frames exactly as received.
+@@ -2156,14 +2181,24 @@
+ 
+ 	ret = rtl8365mb_port_set_vlan_egress_mode(priv, port, mode);
+ 	if (ret)
+-		goto undo_set_framefilter;
++		goto undo_set_pvid;
+ 
+-	return ret;
++	goto out_unlock;
++
++undo_set_pvid:
++	if (pvid_vid != prev_pvid_vid) {
++		if (prev_pvid_vid)
++			(void)rtl8365mb_vlan_pvid_port_set(ds, port,
++							   prev_pvid_vid,
++							   NULL);
++		else
++			(void)rtl8365mb_vlan_pvid_port_clear(ds, port,
++							     pvid_vid);
++	}
+ 
+-undo_set_framefilter:
+-	if (prev_accepted_frame != accepted_frame)
+-		rtl8365mb_vlan_port_set_framefilter(priv, port,
+-						    prev_accepted_frame);
++	/* after the PVID, as restoring it may change the accepted frame type */
++	(void)rtl8365mb_vlan_port_set_framefilter(priv, port,
++						  prev_accepted_frame);
+ undo_transparent:
+ 	/* The DSA core guarantees this callback is only invoked on an actual
+ 	 * state transition, ensuring the previous hardware state was the
+@@ -2182,6 +2217,8 @@
+ 
+ 	rtl8365mb_port_set_ingress_filtering(priv, port, !vlan_filtering);
+ 
++out_unlock:
++	mutex_unlock(&priv->vlan_lock);
+ 	return ret;
+ }
+ 
+@@ -2191,8 +2228,11 @@
+ {
+ 	bool untagged = !!(vlan->flags & BRIDGE_VLAN_INFO_UNTAGGED);
+ 	bool pvid = !!(vlan->flags & BRIDGE_VLAN_INFO_PVID);
+-	u16 pvid_vid;
+ 	struct realtek_priv *priv = ds->priv;
++	struct rtl8365mb *mb = priv->chip_data;
++	struct rtl8365mb_port *p = &mb->ports[port];
++	bool vlan_filtering;
++	u16 pvid_vid = 0;
+ 	int ret;
+ 
+ 	dev_dbg(priv->dev, "add VLAN %d on port %d, %s, %s\n",
+@@ -2206,23 +2246,32 @@
+ 		return -EOPNOTSUPP;
+ 	}
+ 
+-	mutex_lock(&priv->vlan_lock);
++	/* The bridge PVID is always recorded, but only programmed while the
++	 * port is VLAN-aware. Otherwise, port_vlan_filtering() programs it
++	 * once filtering is enabled.
++	 */
++	vlan_filtering = dsa_port_is_vlan_filtering(dsa_to_port(ds, port));
+ 
+-	ret = rtl8365mb_vlan_port_get_pvid(priv, port, &pvid_vid);
+-	if (ret)
+-		goto out_unlock;
++	mutex_lock(&priv->vlan_lock);
+ 
+-	/* Set PVID if needed */
+-	if (pvid) {
+-		ret = rtl8365mb_vlan_pvid_port_set(ds, port, vlan->vid,
+-						   extack);
+-		if (ret)
+-			goto out_unlock;
+-	} else {
+-		/* or try to unset it if not */
+-		ret = rtl8365mb_vlan_pvid_port_clear(ds, port, vlan->vid);
++	if (vlan_filtering) {
++		ret = rtl8365mb_vlan_port_get_pvid(priv, port, &pvid_vid);
+ 		if (ret)
+ 			goto out_unlock;
++
++		/* Set PVID if needed */
++		if (pvid) {
++			ret = rtl8365mb_vlan_pvid_port_set(ds, port, vlan->vid,
++							   extack);
++			if (ret)
++				goto out_unlock;
++		} else {
++			/* or try to unset it if not */
++			ret = rtl8365mb_vlan_pvid_port_clear(ds, port,
++							     vlan->vid);
++			if (ret)
++				goto out_unlock;
++		}
+ 	}
+ 
+ 	/* add port to vlan4k. It knows nothing about PVID */
+@@ -2230,12 +2279,17 @@
+ 	if (ret)
+ 		goto undo_set_pvid;
+ 
++	if (pvid)
++		p->bridge_pvid = vlan->vid;
++	else if (p->bridge_pvid == vlan->vid)
++		p->bridge_pvid = 0;
++
+ 	ret = 0;
+ 	goto out_unlock;
+ 
+ undo_set_pvid:
+ 	/* undo the pvid definition */
+-	if (pvid != (pvid_vid == vlan->vid)) {
++	if (vlan_filtering && pvid != (pvid_vid == vlan->vid)) {
+ 		if (pvid_vid)
+ 			(void)rtl8365mb_vlan_pvid_port_set(ds, port, pvid_vid,
+ 							   NULL);
+@@ -2254,6 +2308,8 @@
+ 	bool untagged = !!(vlan->flags & BRIDGE_VLAN_INFO_UNTAGGED);
+ 	bool pvid = !!(vlan->flags & BRIDGE_VLAN_INFO_PVID);
+ 	struct realtek_priv *priv = ds->priv;
++	struct rtl8365mb *mb = priv->chip_data;
++	struct rtl8365mb_port *p = &mb->ports[port];
+ 	int ret;
+ 
+ 	dev_dbg(priv->dev, "del VLAN %d on port %d, %s, %s\n",
+@@ -2265,15 +2321,21 @@
+ 		return -EOPNOTSUPP;
+ 
+ 	mutex_lock(&priv->vlan_lock);
+-	ret = rtl8365mb_vlan_pvid_port_clear(ds, port, vlan->vid);
+-	if (ret)
+-		goto out_unlock;
++
++	/* The switch only uses the bridge PVID while VLAN-aware */
++	if (dsa_port_is_vlan_filtering(dsa_to_port(ds, port))) {
++		ret = rtl8365mb_vlan_pvid_port_clear(ds, port, vlan->vid);
++		if (ret)
++			goto out_unlock;
++	}
+ 
+ 	ret = rtl8365mb_vlan_4k_port_del(ds, port, vlan);
+ 	/* There is little incentive to try to undo the removal of PVID (if it
+ 	 * was really in use) as an error here might indicate the ASIC stopped
+ 	 * to answer.
+ 	 */
++	if (!ret && p->bridge_pvid == vlan->vid)
++		p->bridge_pvid = 0;
+ 
+ out_unlock:
+ 	mutex_unlock(&priv->vlan_lock);
+@@ -2285,13 +2347,27 @@
+  * Standalone forwarding relies on transparent VLAN mode combined with per-port
+  * isolation masks restricting egress to CPU ports only.
+  *
++ * VLAN-unaware ports, both standalone and in a VLAN-unaware bridge, use PVID
++ * 0. DSA installs their FDB and MDB entries with VID 0, and expects all of
++ * their packets to match them, so VID 0 is set up with IVL like every other
++ * VLAN. The bridge PVID is only programmed while the port is VLAN-aware.
+  */
+ static int rtl8365mb_vlan_setup(struct dsa_switch *ds)
+ {
+ 	struct realtek_priv *priv = ds->priv;
+ 	struct dsa_port *dp;
++	u32 members = 0;
+ 	int ret;
+ 
++	dsa_switch_for_each_available_port(dp, ds)
++		members |= BIT(dp->index);
++
++	ret = rtl8365mb_vlan_4k_unaware_setup(priv, members);
++	if (ret) {
++		dev_err(priv->dev, "Failed to set up VLAN 0\n");
++		return ret;
++	}
++
+ 	dsa_switch_for_each_available_port(dp, ds) {
+ 		/* Disable vlan-filtering for all ports */
+ 		ret = rtl8365mb_port_vlan_filtering(ds, dp->index, false, NULL);
+--- a/drivers/net/dsa/realtek/rtl8365mb_vlan.c
++++ b/drivers/net/dsa/realtek/rtl8365mb_vlan.c
+@@ -42,7 +42,8 @@
+  *    may be useful for ACL rules which specify alternative forwarding
+  *    decisions.
+  *
+- * VLANMC index 0 is reserved as a neutral PVID, used for standalone ports.
++ * VLANMC index 0 is reserved as a neutral PVID, used for VLAN-unaware ports,
++ * both standalone and in a VLAN-unaware bridge. It uses VID 0.
+  *
+  * The RTL8367D family has no VLAN membership config database. Its PVID
+  * registers hold the VID itself, and its VLAN4k entries are shorter.
+@@ -408,6 +409,40 @@
+ 	return rtl8365mb_vlan_4k_port_set(ds, port, vlan, NULL, false);
+ }
+ 
++/*
++ * rtl8365mb_vlan_4k_unaware_setup() - Set up the VLAN 4K table entry of VID 0
++ * @priv: realtek switch private structure
++ * @members: port mask of the ports using VID 0
++ *
++ * VLAN-unaware ports, both standalone and in a VLAN-unaware bridge, keep PVID
++ * 0, so their untagged and priority-tagged frames are classified to VID 0.
++ * DSA installs the FDB and MDB entries of these ports with VID 0, and this
++ * driver writes all L2 entries with IVL. VID 0 must use IVL as well, or the
++ * lookups of these frames would never hit those entries.
++ *
++ * VLAN-unaware ports do not filter on ingress and are transparent on egress,
++ * so the member set is not checked for them. It still includes all ports,
++ * untagged, so that a frame classified to VID 0 never egresses with a VID 0
++ * tag from a port that follows the untag set.
++ *
++ * VID 0 is reserved by this driver, so port VLAN operations never change
++ * this entry.
++ *
++ * Context: Can sleep. Takes and releases &priv->map_lock.
++ * Return: 0 on success, or a negative error code on failure.
++ */
++int rtl8365mb_vlan_4k_unaware_setup(struct realtek_priv *priv, u32 members)
++{
++	struct rtl8365mb_vlan4k vlan4k = {
++		.vid = 0,
++		.member = members,
++		.untag = members,
++		.ivl_en = true,
++	};
++
++	return rtl8365mb_vlan_4k_write(priv, &vlan4k);
++}
++
+ static int rtl8365mb_vlan_mc_read(struct realtek_priv *priv, u32 index,
+ 				  struct rtl8365mb_vlanmc *vlanmc)
+ {
+--- a/drivers/net/dsa/realtek/rtl8365mb_vlan.h
++++ b/drivers/net/dsa/realtek/rtl8365mb_vlan.h
+@@ -33,6 +33,7 @@
+ 			       struct netlink_ext_ack *extack);
+ int rtl8365mb_vlan_4k_port_del(struct dsa_switch *ds, int port,
+ 			       const struct switchdev_obj_port_vlan *vlan);
++int rtl8365mb_vlan_4k_unaware_setup(struct realtek_priv *priv, u32 members);
+ int rtl8365mb_vlan_pvid_port_set(struct dsa_switch *ds, int port, u16 vid,
+ 				 struct netlink_ext_ack *extack);
+ int rtl8365mb_vlan_pvid_port_clear(struct dsa_switch *ds, int port, u16 vid);
