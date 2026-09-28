@@ -1,0 +1,63 @@
+From: Roman Rikhter <teledurak@gmail.com>
+Subject: [PATCH] wifi: rtw89: pci: don't lose release reports after a bad
+ buffer
+
+A release report buffer without FS and LS set makes
+rtw89_pci_release_tx_skbs() return without consuming it and without
+giving it back to the device, and rtw89_pci_release_tx() then skips all
+the buffers left in the batch. Up to 30 release reports are in a buffer,
+and the TX buffers they are for are never freed: each one keeps its WD
+page and frame, and with AQL the airtime of the frame, until the device
+is reset. Enough of them stop TX. The buffer also stays in the cache
+without the sync for the device, and a later read of it may see the old
+data.
+
+Give such a buffer back to the device and go on with the next one. Also
+don't walk the release reports past the end of the buffer when its
+length is wrong.
+
+Signed-off-by: Roman Rikhter <teledurak@gmail.com>
+---
+diff --git drivers/net/wireless/realtek/rtw89/pci.c drivers/net/wireless/realtek/rtw89/pci.c
+index 3460e7e..86bf361 100644
+--- a/drivers/net/wireless/realtek/rtw89/pci.c
++++ b/drivers/net/wireless/realtek/rtw89/pci.c
+@@ -767,6 +767,7 @@ static u32 rtw89_pci_release_tx_skbs(struct rtw89_dev *rtwdev,
+ 	u32 cnt = 0;
+ 	u32 skb_idx;
+ 	u32 offset;
++	u32 len;
+ 	int ret;
+ 
+ 	skb_idx = rtw89_pci_get_rx_skb_idx(rtwdev, bd_ring);
+@@ -779,21 +780,27 @@ static u32 rtw89_pci_release_tx_skbs(struct rtw89_dev *rtwdev,
+ 		goto err_sync_device;
+ 	}
+ 
++	/*
++	 * Skip a malformed buffer, but only that one: the release reports in
++	 * the next buffers are what frees their TX buffers.
++	 */
+ 	rx_info = RTW89_PCI_RX_SKB_CB(skb);
+-	if (!rx_info->fs || !rx_info->ls) {
++	if (unlikely(!rx_info->fs || !rx_info->ls)) {
+ 		rtw89_err_ratelimited(rtwdev, "cannot process RP frame not set FS/LS\n");
+-		return cnt;
++		goto out;
+ 	}
+ 
+ 	rtw89_chip_query_rxdesc(rtwdev, &desc_info, skb->data, rxinfo_size);
+ 
+ 	/* first segment has RX desc */
+ 	offset = desc_info.offset + desc_info.rxd_len;
+-	for (; offset + rpp_size <= rx_info->len; offset += rpp_size) {
++	len = min_t(u32, rx_info->len, rx_ring->buf_sz);
++	for (; offset + rpp_size <= len; offset += rpp_size) {
+ 		rpp = skb->data + offset;
+ 		rtw89_pci_release_rpp(rtwdev, rpp);
+ 	}
+ 
++out:
+ 	rtw89_pci_sync_skb_for_device(rtwdev, skb);
+ 	rtw89_pci_rxbd_increase(rx_ring, 1);
+ 	cnt++;
