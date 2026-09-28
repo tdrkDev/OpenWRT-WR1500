@@ -1,0 +1,32 @@
+From: Roman Rikhter <teledurak@gmail.com>
+Subject: [PATCH] wifi: rtw89: pci: don't take RX buffers from the memory
+ reserves
+
+A frame received into a buffer of the data ring goes up in that buffer
+when a new one can be allocated for the ring, and is copied otherwise.
+The new buffer is allocated with __dev_alloc_pages(), which adds
+__GFP_MEMALLOC, so the allocation ignores the watermarks and takes pages
+from the reserves that are kept for memory reclaim. The buffers are
+16 KiB each, one for every frame that isn't short, and on a router with
+little memory, under memory pressure, the reserves run out for those
+that need them.
+
+Copying is the fallback already, so add __GFP_NOMEMALLOC: the allocation
+keeps to the limits of GFP_ATOMIC, and the frame is copied when it fails.
+
+Signed-off-by: Roman Rikhter <teledurak@gmail.com>
+---
+diff --git drivers/net/wireless/realtek/rtw89/pci.c drivers/net/wireless/realtek/rtw89/pci.c
+index e519090..b4850cd 100644
+--- a/drivers/net/wireless/realtek/rtw89/pci.c
++++ b/drivers/net/wireless/realtek/rtw89/pci.c
+@@ -379,7 +379,8 @@ static bool rtw89_pci_rx_swap_skb(struct rtw89_dev *rtwdev,
+ 		return false;
+ 	}
+ 
+-	new = rtw89_pci_alloc_rx_page_skb(GFP_ATOMIC);
++	/* the frame can be copied: leave the memory reserves to others */
++	new = rtw89_pci_alloc_rx_page_skb(GFP_ATOMIC | __GFP_NOMEMALLOC);
+ 	if (!new)
+ 		return false;
+ 
