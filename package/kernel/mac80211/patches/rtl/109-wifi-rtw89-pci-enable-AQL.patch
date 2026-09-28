@@ -1,0 +1,61 @@
+From: Roman Rikhter <teledurak@gmail.com>
+Subject: [PATCH] wifi: rtw89: pci: enable AQL
+
+rtw89 has no airtime queue limits: mac80211 hands over frames as long as
+the DMA rings have room (256 descriptors per AC, each for a frame or an
+A-MSDU), shared by all stations. Under load the queue builds up in the
+hardware, where the fq_codel of mac80211 can neither see nor manage it.
+
+Enable AQL for PCI devices. mac80211 estimates the airtime of each frame
+from the last TX rate of the station, which rtw89 doesn't report yet:
+pass the rate of each firmware RA report to mac80211 with a rate-only
+ieee80211_tx_status_ext(). A station over its limit is held back until
+TX completions return its airtime; the TX queue work now runs on TX
+completion, so its frames go out then. Every TX frame ends in
+ieee80211_tx_status_ni() or ieee80211_free_txskb(), which return the
+airtime of the frame.
+
+Signed-off-by: Roman Rikhter <teledurak@gmail.com>
+---
+diff --git drivers/net/wireless/realtek/rtw89/pci.c drivers/net/wireless/realtek/rtw89/pci.c
+index bdfdc69..3da69e5 100644
+--- a/drivers/net/wireless/realtek/rtw89/pci.c
++++ b/drivers/net/wireless/realtek/rtw89/pci.c
+@@ -5104,6 +5104,9 @@ int rtw89_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 		rtwdev->hw->max_tx_fragments = RTW89_TXADDR_INFO_NR_V1;
+ 	}
+ 
++	/* TX completions kick the TX queues (rtw89_pci_poll_rpq_dma()) */
++	wiphy_ext_feature_set(rtwdev->hw->wiphy, NL80211_EXT_FEATURE_AQL);
++
+ 	ret = rtw89_core_register(rtwdev);
+ 	if (ret) {
+ 		rtw89_err(rtwdev, "failed to register core\n");
+diff --git drivers/net/wireless/realtek/rtw89/phy.c drivers/net/wireless/realtek/rtw89/phy.c
+index 759be4d..05e0701 100644
+--- a/drivers/net/wireless/realtek/rtw89/phy.c
++++ b/drivers/net/wireless/realtek/rtw89/phy.c
+@@ -3237,6 +3237,12 @@ static void __rtw89_phy_c2h_ra_rpt_iter(struct rtw89_sta_link *rtwsta_link,
+ 	struct rtw89_ra_report *ra_report = &rtwsta_link->ra_report;
+ 	const struct rtw89_chip_info *chip = rtwdev->chip;
+ 	bool format_v1 = chip->chip_gen == RTW89_CHIP_BE;
++	struct ieee80211_rate_status rate_status = {};
++	struct ieee80211_tx_status tx_status = {
++		.sta = rtwsta_link_to_sta(rtwsta_link),
++		.rates = &rate_status,
++		.n_rates = 1,
++	};
+ 	u8 mode, rate, bw, giltf, mac_id;
+ 	u16 legacy_bitrate, amsdu_len;
+ 	u8 retry_ratio = 0;
+@@ -3339,6 +3345,10 @@ static void __rtw89_phy_c2h_ra_rpt_iter(struct rtw89_sta_link *rtwsta_link,
+ 	ra_report->retry_ratio = retry_ratio;
+ 	ra_report->might_fallback_legacy = mcs <= 2;
+ 
++	/* the expected airtime of AQL is based on the last TX rate */
++	rate_status.rate_idx = ra_report->txrate;
++	ieee80211_tx_status_ext(rtwdev->hw, &tx_status);
++
+ 	amsdu_len = get_max_amsdu_len(rtwdev, ra_report);
+ 	if (link_sta->agg.max_rc_amsdu_len != amsdu_len) {
+ 		link_sta->agg.max_rc_amsdu_len = amsdu_len;
