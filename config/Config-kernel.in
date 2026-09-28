@@ -808,6 +808,15 @@ config KERNEL_SOFTLOCKUP_DETECTOR
 	  chance to run.  The current stack trace is displayed upon
 	  detection and the system will stay locked up.
 
+config KERNEL_BOOTPARAM_SOFTLOCKUP_PANIC
+	bool "Panic (Reboot) On Soft Lockups"
+	depends on KERNEL_SOFTLOCKUP_DETECTOR
+	help
+	  Say Y here to enable the kernel to panic on "soft lockups",
+	  which are bugs that cause the kernel to loop in kernel
+	  mode for more than 20 seconds, without giving other tasks a
+	  chance to run. With kernel.panic set, the system reboots.
+
 config KERNEL_HARDLOCKUP_DETECTOR
 	bool "Compile the kernel with detect Hard Lockups"
 	depends on KERNEL_DEBUG_KERNEL
