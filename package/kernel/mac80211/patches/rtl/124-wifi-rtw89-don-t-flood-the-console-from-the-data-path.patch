@@ -1,0 +1,378 @@
+From: Roman Rikhter <teledurak@gmail.com>
+Subject: [PATCH] wifi: rtw89: don't flood the console from the data path
+
+When a frame can't be sent, rtw89 reports it at error level in every
+function on the way: "no available TXBD" (or "no available TXWD" and
+"failed to submit TXBD"), "failed to TX Queue 9", "failed to transmit
+skb to HCI" and "failed to transmit skb: -28" for one frame. Nothing
+limits the rate, and what fails for one frame usually fails for the next
+ones. On a router with a 38400 Bd serial console, each line keeps
+interrupts off for 20-30 ms while it is printed, so a burst of such
+frames stops the system.
+
+Frames that don't come from the TX queues make it likely: group
+addressed frames that wait for the DTIM beacon while a station sleeps,
+responses to PS-Poll and U-APSD triggers, and management frames are
+handed to rtw89_ops_tx() without any check for room in the DMA ring,
+which is only reclaimed when the TX queues look. A dozing station and a
+burst of broadcasts fill the ring for the high queue, and every frame
+after that fails.
+
+When the ring of a PCI device looks full, reclaim what the device has
+fetched and try again, and drop the frame quietly when there is still no
+room. Report a failure only where it ends, and demote the reports on the
+way to debug messages. Give these messages one rate limit per device, of
+three messages per five seconds, so that failures of different kinds
+can't add up. The per-frame errors of the RX and release report paths
+share this limit.
+
+Signed-off-by: Roman Rikhter <teledurak@gmail.com>
+---
+diff --git drivers/net/wireless/realtek/rtw89/core.c drivers/net/wireless/realtek/rtw89/core.c
+index b31e6df..127c0d8 100644
+--- a/drivers/net/wireless/realtek/rtw89/core.c
++++ b/drivers/net/wireless/realtek/rtw89/core.c
+@@ -1384,13 +1384,14 @@ int rtw89_h2c_tx(struct rtw89_dev *rtwdev,
+ 
+ 	cnt = rtw89_hci_check_and_reclaim_tx_resource(rtwdev, RTW89_TXCH_CH12);
+ 	if (cnt == 0) {
+-		rtw89_err(rtwdev, "no tx fwcmd resource\n");
++		rtw89_err_ratelimited(rtwdev, "no tx fwcmd resource\n");
+ 		return -ENOSPC;
+ 	}
+ 
+ 	ret = rtw89_hci_tx_write(rtwdev, &tx_req);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to transmit skb to HCI\n");
++		rtw89_debug(rtwdev, RTW89_DBG_TXRX,
++			    "failed to transmit skb to HCI: %d\n", ret);
+ 		return ret;
+ 	}
+ 	rtw89_hci_tx_kick_off(rtwdev, RTW89_TXCH_CH12);
+@@ -1427,7 +1428,8 @@ static int rtw89_core_tx_write_link(struct rtw89_dev *rtwdev,
+ 
+ 	ret = rtw89_hci_tx_write(rtwdev, &tx_req);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to transmit skb to HCI\n");
++		rtw89_debug(rtwdev, RTW89_DBG_TXRX,
++			    "failed to transmit skb to HCI: %d\n", ret);
+ 		return ret;
+ 	}
+ 
+@@ -1448,7 +1450,7 @@ int rtw89_core_tx_write(struct rtw89_dev *rtwdev, struct ieee80211_vif *vif,
+ 	if (rtwsta) {
+ 		rtwsta_link = rtw89_get_designated_link(rtwsta);
+ 		if (unlikely(!rtwsta_link)) {
+-			rtw89_err(rtwdev, "tx: find no sta designated link\n");
++			rtw89_err_ratelimited(rtwdev, "tx: find no sta designated link\n");
+ 			return -ENOLINK;
+ 		}
+ 
+@@ -1456,7 +1458,7 @@ int rtw89_core_tx_write(struct rtw89_dev *rtwdev, struct ieee80211_vif *vif,
+ 	} else {
+ 		rtwvif_link = rtw89_get_designated_link(rtwvif);
+ 		if (unlikely(!rtwvif_link)) {
+-			rtw89_err(rtwdev, "tx: find no vif designated link\n");
++			rtw89_err_ratelimited(rtwdev, "tx: find no vif designated link\n");
+ 			return -ENOLINK;
+ 		}
+ 	}
+@@ -4758,7 +4760,7 @@ static void rtw89_core_txq_push(struct rtw89_dev *rtwdev,
+ 		rtw89_core_txq_check_agg(rtwdev, rtwtxq, skb);
+ 		ret = rtw89_core_tx_write(rtwdev, vif, sta, skb, NULL);
+ 		if (ret) {
+-			rtw89_err(rtwdev, "failed to push txq: %d\n", ret);
++			rtw89_err_ratelimited(rtwdev, "failed to push txq: %d\n", ret);
+ 			ieee80211_free_txskb(rtwdev->hw, skb);
+ 			break;
+ 		}
+@@ -4889,7 +4891,7 @@ bottom:
+ 	while ((skb = skb_dequeue(&rtwsta->roc_queue))) {
+ 		ret = rtw89_core_tx_write(rtwdev, vif, sta, skb, &qsel);
+ 		if (ret) {
+-			rtw89_warn(rtwdev, "pending tx failed with %d\n", ret);
++			rtw89_warn_ratelimited(rtwdev, "pending tx failed with %d\n", ret);
+ 			dev_kfree_skb_any(skb);
+ 		} else {
+ 			rtw89_core_tx_kick_off(rtwdev, qsel);
+@@ -6927,6 +6929,7 @@ int rtw89_core_init(struct rtw89_dev *rtwdev)
+ 		return -ENOMEM;
+ 	spin_lock_init(&rtwdev->ba_lock);
+ 	spin_lock_init(&rtwdev->rpwm_lock);
++	ratelimit_state_init(&rtwdev->err_rs, DEFAULT_RATELIMIT_INTERVAL, 3);
+ 	rtwdev->total_sta_assoc = 0;
+ 
+ 	rtw89_init_wait(&rtwdev->mcc.wait);
+diff --git drivers/net/wireless/realtek/rtw89/core.h drivers/net/wireless/realtek/rtw89/core.h
+index dc1edfb..d0bc3c8 100644
+--- a/drivers/net/wireless/realtek/rtw89/core.h
++++ b/drivers/net/wireless/realtek/rtw89/core.h
+@@ -10,6 +10,7 @@
+ #include <linux/dmi.h>
+ #include <linux/firmware.h>
+ #include <linux/iopoll.h>
++#include <linux/ratelimit.h>
+ #include <linux/workqueue.h>
+ #include <net/mac80211.h>
+ 
+@@ -6500,6 +6501,9 @@ struct rtw89_dev {
+ 
+ 	struct rtw89_fw_cmd_ofld_info *fw_cmd_ofld_info;
+ 
++	/* one budget for the errors that repeat, such as for every frame */
++	struct ratelimit_state err_rs;
++
+ 	struct rtw89_sta_link __rcu *assoc_link_on_macid[RTW89_MAX_MAC_ID_NUM];
+ 	refcount_t refcount_ap_info;
+ 
+diff --git drivers/net/wireless/realtek/rtw89/debug.h drivers/net/wireless/realtek/rtw89/debug.h
+index 495c44f..056d991 100644
+--- a/drivers/net/wireless/realtek/rtw89/debug.h
++++ b/drivers/net/wireless/realtek/rtw89/debug.h
+@@ -62,6 +62,22 @@ static inline void rtw89_debugfs_deinit(struct rtw89_dev *rtwdev) {}
+ #define rtw89_warn(rtwdev, a...) dev_warn((rtwdev)->dev, ##a)
+ #define rtw89_err(rtwdev, a...) dev_err((rtwdev)->dev, ##a)
+ 
++/*
++ * A failure in the data path tends to repeat for every frame, and to be
++ * reported by each function on the way. Keep a failing device from
++ * flooding the log and a slow console.
++ */
++#define rtw89_warn_ratelimited(rtwdev, a...)				\
++do {									\
++	if (__ratelimit(&(rtwdev)->err_rs))				\
++		rtw89_warn(rtwdev, ##a);				\
++} while (0)
++#define rtw89_err_ratelimited(rtwdev, a...)				\
++do {									\
++	if (__ratelimit(&(rtwdev)->err_rs))				\
++		rtw89_err(rtwdev, ##a);					\
++} while (0)
++
+ #ifdef CPTCFG_RTW89_DEBUGMSG
+ extern unsigned int rtw89_debug_mask;
+ 
+diff --git drivers/net/wireless/realtek/rtw89/mac80211.c drivers/net/wireless/realtek/rtw89/mac80211.c
+index c9a0bbb..dc86904 100644
+--- a/drivers/net/wireless/realtek/rtw89/mac80211.c
++++ b/drivers/net/wireless/realtek/rtw89/mac80211.c
+@@ -38,7 +38,10 @@ static void rtw89_ops_tx(struct ieee80211_hw *hw,
+ 
+ 	ret = rtw89_core_tx_write(rtwdev, vif, sta, skb, &qsel);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to transmit skb: %d\n", ret);
++		if (ret == -ENOSPC)
++			rtw89_debug(rtwdev, RTW89_DBG_TXRX, "no room to transmit skb\n");
++		else
++			rtw89_err_ratelimited(rtwdev, "failed to transmit skb: %d\n", ret);
+ 		ieee80211_free_txskb(hw, skb);
+ 		return;
+ 	}
+diff --git drivers/net/wireless/realtek/rtw89/pci.c drivers/net/wireless/realtek/rtw89/pci.c
+index b4850cd..54e605d 100644
+--- a/drivers/net/wireless/realtek/rtw89/pci.c
++++ b/drivers/net/wireless/realtek/rtw89/pci.c
+@@ -108,7 +108,7 @@ static void rtw89_pci_release_fwcmd(struct rtw89_dev *rtwdev,
+ 	while (cnt--) {
+ 		skb = skb_dequeue(&rtwpci->h2c_queue);
+ 		if (!skb) {
+-			rtw89_err(rtwdev, "failed to pre-release fwcmd\n");
++			rtw89_err_ratelimited(rtwdev, "failed to pre-release fwcmd\n");
+ 			return;
+ 		}
+ 		skb_queue_tail(&rtwpci->h2c_release_queue, skb);
+@@ -121,7 +121,7 @@ static void rtw89_pci_release_fwcmd(struct rtw89_dev *rtwdev,
+ 	while (qlen--) {
+ 		skb = skb_dequeue(&rtwpci->h2c_release_queue);
+ 		if (!skb) {
+-			rtw89_err(rtwdev, "failed to release fwcmd\n");
++			rtw89_err_ratelimited(rtwdev, "failed to release fwcmd\n");
+ 			return;
+ 		}
+ 		tx_data = RTW89_PCI_TX_SKB_CB(skb);
+@@ -420,8 +420,8 @@ static u32 rtw89_pci_rxbd_deliver_skbs(struct rtw89_dev *rtwdev,
+ 
+ 	ret = rtw89_pci_sync_skb_for_device_and_validate_rx_info(rtwdev, rx_ring, skb);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to update %d RXBD info: %d\n",
+-			  bd_ring->wp, ret);
++		rtw89_err_ratelimited(rtwdev, "failed to update %d RXBD info: %d\n",
++				      bd_ring->wp, ret);
+ 		goto err_sync_device;
+ 	}
+ 
+@@ -441,7 +441,7 @@ static u32 rtw89_pci_rxbd_deliver_skbs(struct rtw89_dev *rtwdev,
+ 			goto err_sync_device;
+ 		}
+ 		if (desc_info->ready) {
+-			rtw89_warn(rtwdev, "desc info should not be ready before first segment start\n");
++			rtw89_warn_ratelimited(rtwdev, "desc info should not be ready before first segment start\n");
+ 			goto err_sync_device;
+ 		}
+ 
+@@ -477,7 +477,7 @@ static u32 rtw89_pci_rxbd_deliver_skbs(struct rtw89_dev *rtwdev,
+ 	rtw89_pci_rxbd_increase(rx_ring, 1);
+ 
+ 	if (!desc_info->ready) {
+-		rtw89_warn(rtwdev, "no rx desc information\n");
++		rtw89_warn_ratelimited(rtwdev, "no rx desc information\n");
+ 		goto err_free_resource;
+ 	}
+ 	if (ls) {
+@@ -510,7 +510,7 @@ static void rtw89_pci_rxbd_deliver(struct rtw89_dev *rtwdev,
+ 	while (cnt && rtwdev->napi_budget_countdown > 0) {
+ 		rx_cnt = rtw89_pci_rxbd_deliver_skbs(rtwdev, rx_ring);
+ 		if (!rx_cnt) {
+-			rtw89_err(rtwdev, "failed to deliver RXBD skb\n");
++			rtw89_err_ratelimited(rtwdev, "failed to deliver RXBD skb\n");
+ 
+ 			/* skip the rest RXBD bufs */
+ 			rtw89_pci_rxbd_increase(rx_ring, cnt);
+@@ -580,7 +580,7 @@ static void rtw89_pci_tx_status(struct rtw89_dev *rtwdev,
+ 			tx_ring->tx_mac_id_drop++;
+ 			break;
+ 		default:
+-			rtw89_warn(rtwdev, "invalid TX status %x\n", tx_status);
++			rtw89_warn_ratelimited(rtwdev, "invalid TX status %x\n", tx_status);
+ 			break;
+ 		}
+ 	}
+@@ -597,7 +597,7 @@ static void rtw89_pci_reclaim_txbd(struct rtw89_dev *rtwdev, struct rtw89_pci_tx
+ 	while (cnt--) {
+ 		txwd = list_first_entry_or_null(&tx_ring->busy_pages, struct rtw89_pci_tx_wd, list);
+ 		if (!txwd) {
+-			rtw89_warn(rtwdev, "No busy txwd pages available\n");
++			rtw89_warn_ratelimited(rtwdev, "No busy txwd pages available\n");
+ 			break;
+ 		}
+ 
+@@ -659,8 +659,8 @@ static void rtw89_pci_release_txwd_skb(struct rtw89_dev *rtwdev,
+ 		 * In normal mode, it should not happen so give it a warning.
+ 		 */
+ 		if (!rtwpci->low_power && !list_empty(&txwd->list))
+-			rtw89_warn(rtwdev, "queue %d txwd %d is not idle\n",
+-				   txch, seq);
++			rtw89_warn_ratelimited(rtwdev, "queue %d txwd %d is not idle\n",
++					       txch, seq);
+ 	}
+ 
+ 	skb_queue_walk_safe(&txwd->queue, skb, tmp) {
+@@ -717,13 +717,13 @@ static void rtw89_pci_release_rpp(struct rtw89_dev *rtwdev, void *rpp)
+ 
+ 	if (unlikely(rpp_info.txch >= RTW89_TXCH_NUM ||
+ 		     info->tx_dma_ch_mask & BIT(rpp_info.txch))) {
+-		rtw89_warn(rtwdev, "should no release report on txch %d\n",
+-			   rpp_info.txch);
++		rtw89_warn_ratelimited(rtwdev, "should no release report on txch %d\n",
++				       rpp_info.txch);
+ 		return;
+ 	}
+ 
+ 	if (unlikely(rpp_info.seq >= RTW89_PCI_TXWD_NUM_MAX)) {
+-		rtw89_warn(rtwdev, "invalid seq %d\n", rpp_info.seq);
++		rtw89_warn_ratelimited(rtwdev, "invalid seq %d\n", rpp_info.seq);
+ 		return;
+ 	}
+ 
+@@ -774,14 +774,14 @@ static u32 rtw89_pci_release_tx_skbs(struct rtw89_dev *rtwdev,
+ 
+ 	ret = rtw89_pci_sync_skb_for_device_and_validate_rx_info(rtwdev, rx_ring, skb);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to update %d RXBD info: %d\n",
+-			  bd_ring->wp, ret);
++		rtw89_err_ratelimited(rtwdev, "failed to update %d RXBD info: %d\n",
++				      bd_ring->wp, ret);
+ 		goto err_sync_device;
+ 	}
+ 
+ 	rx_info = RTW89_PCI_RX_SKB_CB(skb);
+ 	if (!rx_info->fs || !rx_info->ls) {
+-		rtw89_err(rtwdev, "cannot process RP frame not set FS/LS\n");
++		rtw89_err_ratelimited(rtwdev, "cannot process RP frame not set FS/LS\n");
+ 		return cnt;
+ 	}
+ 
+@@ -815,7 +815,7 @@ static void rtw89_pci_release_tx(struct rtw89_dev *rtwdev,
+ 	while (cnt) {
+ 		release_cnt = rtw89_pci_release_tx_skbs(rtwdev, rx_ring, cnt);
+ 		if (!release_cnt) {
+-			rtw89_err(rtwdev, "failed to release TX skbs\n");
++			rtw89_err_ratelimited(rtwdev, "failed to release TX skbs\n");
+ 
+ 			/* skip the rest RXBD bufs */
+ 			rtw89_pci_rxbd_increase(rx_ring, cnt);
+@@ -1769,7 +1769,7 @@ static int rtw89_pci_txwd_submit(struct rtw89_dev *rtwdev,
+ 		dma = dma_map_single(&pdev->dev, skb->data, skb->len,
+ 				     DMA_TO_DEVICE);
+ 		if (dma_mapping_error(&pdev->dev, dma)) {
+-			rtw89_err(rtwdev, "failed to map skb dma data\n");
++			rtw89_debug(rtwdev, RTW89_DBG_TXRX, "failed to map skb dma data\n");
+ 			ret = -EBUSY;
+ 			goto err;
+ 		}
+@@ -1834,7 +1834,7 @@ static int rtw89_pci_fwcmd_submit(struct rtw89_dev *rtwdev,
+ 
+ 	dma = dma_map_single(&pdev->dev, skb->data, skb->len, DMA_TO_DEVICE);
+ 	if (dma_mapping_error(&pdev->dev, dma)) {
+-		rtw89_err(rtwdev, "failed to map fwcmd dma data\n");
++		rtw89_err_ratelimited(rtwdev, "failed to map fwcmd dma data\n");
+ 		return -EBUSY;
+ 	}
+ 
+@@ -1869,14 +1869,15 @@ static int rtw89_pci_txbd_submit(struct rtw89_dev *rtwdev,
+ 
+ 	txwd = rtw89_pci_dequeue_txwd(tx_ring);
+ 	if (!txwd) {
+-		rtw89_err(rtwdev, "no available TXWD\n");
++		rtw89_debug(rtwdev, RTW89_DBG_TXRX, "no available TXWD\n");
+ 		ret = -ENOSPC;
+ 		goto err;
+ 	}
+ 
+ 	ret = rtw89_pci_txwd_submit(rtwdev, tx_ring, txwd, tx_req);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to submit TXWD %d\n", txwd->seq);
++		rtw89_debug(rtwdev, RTW89_DBG_TXRX, "failed to submit TXWD %d\n",
++			    txwd->seq);
+ 		goto err_enqueue_wd;
+ 	}
+ 
+@@ -1921,7 +1922,7 @@ static int rtw89_pci_tx_write(struct rtw89_dev *rtwdev, struct rtw89_core_tx_req
+ 
+ 	n_avail_txbd = rtw89_pci_get_avail_txbd_num(tx_ring);
+ 	if (n_avail_txbd == 0) {
+-		rtw89_err(rtwdev, "no available TXBD\n");
++		rtw89_debug(rtwdev, RTW89_DBG_TXRX, "no available TXBD\n");
+ 		ret = -ENOSPC;
+ 		goto err_unlock;
+ 	}
+@@ -1929,7 +1930,7 @@ static int rtw89_pci_tx_write(struct rtw89_dev *rtwdev, struct rtw89_core_tx_req
+ 	txbd = rtw89_pci_get_next_txbd(tx_ring);
+ 	ret = rtw89_pci_txbd_submit(rtwdev, tx_ring, txbd, tx_req);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to submit TXBD\n");
++		rtw89_debug(rtwdev, RTW89_DBG_TXRX, "failed to submit TXBD\n");
+ 		goto err_unlock;
+ 	}
+ 
+@@ -1947,8 +1948,19 @@ static int rtw89_pci_ops_tx_write(struct rtw89_dev *rtwdev, struct rtw89_core_tx
+ 	int ret;
+ 
+ 	ret = rtw89_pci_tx_write(rtwdev, tx_req, desc_info->ch_dma);
++
++	/*
++	 * Frames of the TX queues are sent after a look at the room in the
++	 * ring, and the others, such as management frames and those for
++	 * dozing stations, find the ring as the last reclaim left it. Reclaim
++	 * what the device has fetched since, and try again.
++	 */
++	if (ret == -ENOSPC &&
++	    rtw89_pci_check_and_reclaim_tx_resource(rtwdev, desc_info->ch_dma))
++		ret = rtw89_pci_tx_write(rtwdev, tx_req, desc_info->ch_dma);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to TX Queue %d\n", desc_info->ch_dma);
++		rtw89_debug(rtwdev, RTW89_DBG_TXRX, "failed to TX Queue %d\n",
++			    desc_info->ch_dma);
+ 		return ret;
+ 	}
+ 
