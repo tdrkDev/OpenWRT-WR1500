@@ -1,0 +1,198 @@
+From: Roman Rikhter <teledurak@gmail.com>
+Subject: [PATCH] net: dsa: realtek: rtl8365mb: key VID 0 with SVL on the RTL8367D
+
+VLAN-unaware ports use PVID 0, and DSA installs their FDB and MDB entries
+with VID 0. The driver writes every L2 entry with IVL and sets up VID 0
+with IVL as well, so that the lookups of these ports hit those entries.
+
+On an RTL8367D this is not enough: with the PVIDs at 0 and the VID 0 4K
+entry set to IVL, a stream from a switch port to a Wi-Fi client, whose
+address assisted learning installs on the CPU port as {MAC, IVL, VID 0},
+is still flooded as unknown unicast to every other port of the bridge.
+An address the switch learns on such a port reads back as SVL in FID 0:
+the switch learns and looks up these frames in FID 0 with SVL, not under
+IVL VID 0. The vendor driver never uses IVL on this family at all.
+
+On the RTL8367D, key the VID 0 database the way the vendor keys all of
+its entries: write unicast L2 entries of VID 0 with SVL in FID 0, and set
+up the VID 0 4K entry with SVL in FID 0 as well, so that hardware learning
+and the entries installed by DSA use the same key whether or not the
+switch takes the key of VID 0 frames from that entry. The family has no
+EFID, so VLAN-unaware ports cannot be told apart by IVL anyway. Clear the
+port-based FID enable register, so no port overrides FID 0. Pack and
+unpack the FID of SVL entries in the shared VID field, as the vendor does.
+
+Multicast entries keep IVL: standalone and bridged ports share FID 0 on
+this family, and SVL host MDB entries of a standalone port would steer
+the multicast traffic of the bridge to the CPU port only. All other VIDs,
+and the RTL8367C family, keep IVL.
+
+This fixes the flooding left by "net: dsa: realtek: rtl8365mb: keep PVID
+0 on VLAN-unaware ports" on the RTL8367D. On a Cudy WR1500, unicast from
+a LAN port to a Wi-Fi client is no longer copied to the other LAN ports.
+
+Signed-off-by: Roman Rikhter <teledurak@gmail.com>
+---
+--- a/drivers/net/dsa/realtek/rtl8365mb_l2.c
++++ b/drivers/net/dsa/realtek/rtl8365mb_l2.c
+@@ -155,6 +155,28 @@
+ 					     RTL8365MB_L2_ENTRY_SIZE;
+ }
+ 
++/**
++ * rtl8365mb_l2_ivl() - whether unicast entries of a VID use IVL
++ * @priv: realtek switch private structure
++ * @vid: VLAN ID of the entry, 0 for VLAN-unaware ports
++ *
++ * DSA installs the FDB entries of VLAN-unaware ports with VID 0. On the
++ * RTL8367D, which has no EFID, the VID 0 database is keyed with SVL in FID 0,
++ * both in its unicast L2 entries and in the VID 0 4K entry, so that the
++ * entries installed by DSA and the addresses the switch learns use the same
++ * key. All other VIDs, and the RTL8367C family, use IVL.
++ *
++ * Multicast entries keep IVL: standalone and bridged ports share FID 0 on the
++ * RTL8367D, and SVL host MDB entries of a standalone port would steer the
++ * multicast traffic of a bridge to the CPU port only.
++ *
++ * Return: true if the entry uses IVL, false for SVL in FID 0.
++ */
++bool rtl8365mb_l2_ivl(struct realtek_priv *priv, u16 vid)
++{
++	return vid || !rtl8365mb_is_family_d(priv);
++}
++
+ static void rtl8365mb_l2_data_to_uc(struct realtek_priv *priv, const u16 *data,
+ 				    struct rtl8365mb_l2_uc *uc)
+ {
+@@ -170,8 +192,13 @@
+ 	uc->key.mac_addr[0] = FIELD_GET(RTL8365MB_L2_UC_D2_MAC0_MSK, data[2]);
+ 
+ 	if (rtl8365mb_is_family_d(priv)) {
+-		uc->key.vid = FIELD_GET(RTL8365MB_L2_UC_D3_VID_MSK, data[3]);
++		/* The VID field holds the FID of SVL entries */
+ 		uc->key.ivl = FIELD_GET(RTL8365MB_L2_UC_D3_IVL_MSK, data[3]);
++		val = FIELD_GET(RTL8365MB_L2_UC_D3_VID_MSK, data[3]);
++		if (uc->key.ivl)
++			uc->key.vid = val;
++		else
++			uc->key.fid = val;
+ 		uc->age = FIELD_GET(RTL8367D_L2_UC_D4_AGE_MSK, data[4]);
+ 		uc->is_static = FIELD_GET(RTL8367D_L2_UC_D4_STATIC_MSK, data[4]);
+ 
+@@ -219,7 +246,11 @@
+ 		FIELD_PREP(RTL8365MB_L2_UC_D2_MAC1_MSK, uc->key.mac_addr[1]);
+ 	data[2] |=
+ 		FIELD_PREP(RTL8365MB_L2_UC_D2_MAC0_MSK, uc->key.mac_addr[0]);
+-	data[3] |= FIELD_PREP(RTL8365MB_L2_UC_D3_VID_MSK, uc->key.vid);
++	/* The RTL8367D keeps the FID of SVL entries in the VID field */
++	if (rtl8365mb_is_family_d(priv) && !uc->key.ivl)
++		data[3] |= FIELD_PREP(RTL8365MB_L2_UC_D3_VID_MSK, uc->key.fid);
++	else
++		data[3] |= FIELD_PREP(RTL8365MB_L2_UC_D3_VID_MSK, uc->key.vid);
+ 	data[3] |= FIELD_PREP(RTL8365MB_L2_UC_D3_IVL_MSK, uc->key.ivl);
+ 
+ 	if (rtl8365mb_is_family_d(priv)) {
+@@ -391,7 +422,7 @@
+ 	memcpy(uc.key.mac_addr, mac_addr, ETH_ALEN);
+ 	uc.key.efid = efid;
+ 	uc.key.fid = 0;
+-	uc.key.ivl = true;
++	uc.key.ivl = rtl8365mb_l2_ivl(priv, vid);
+ 	uc.key.vid = vid;
+ 
+ 	uc.port = port;
+@@ -432,7 +463,7 @@
+ 	memcpy(uc.key.mac_addr, mac_addr, ETH_ALEN);
+ 	uc.key.efid = efid;
+ 	uc.key.fid = 0;
+-	uc.key.ivl = true;
++	uc.key.ivl = rtl8365mb_l2_ivl(priv, vid);
+ 	uc.key.vid = vid;
+ 	/* age 0 deletes the entry */
+ 	uc.age = 0;
+--- a/drivers/net/dsa/realtek/rtl8365mb_l2.h
++++ b/drivers/net/dsa/realtek/rtl8365mb_l2.h
+@@ -12,6 +12,7 @@
+ 
+ #include "realtek.h"
+ 
++bool rtl8365mb_l2_ivl(struct realtek_priv *priv, u16 vid);
+ int rtl8365mb_l2_get_next_uc(struct realtek_priv *priv, u16 *addr, int port,
+ 			     struct realtek_fdb_entry *entry);
+ int rtl8365mb_l2_add_uc(struct realtek_priv *priv, int port,
+--- a/drivers/net/dsa/realtek/rtl8365mb_main.c
++++ b/drivers/net/dsa/realtek/rtl8365mb_main.c
+@@ -397,6 +397,9 @@
+ #define RTL8367D_LOOKUP_HIT_ISO_ACT_REG		0x0A10
+ #define   RTL8367D_LOOKUP_HIT_ISO_ACT_UNKNOWN	0x0001
+ 
++/* RTL8367D family port-based FID enable register */
++#define RTL8367D_PORT_PBFIDEN_REG		0x07AC
++
+ /* CPU port mask register - controls which ports are treated as CPU ports */
+ #define RTL8365MB_CPU_PORT_MASK_REG	0x1219
+ #define   RTL8365MB_CPU_PORT_MASK_MASK	0x07FF
+@@ -2349,8 +2352,9 @@
+  *
+  * VLAN-unaware ports, both standalone and in a VLAN-unaware bridge, use PVID
+  * 0. DSA installs their FDB and MDB entries with VID 0, and expects all of
+- * their packets to match them, so VID 0 is set up with IVL like every other
+- * VLAN. The bridge PVID is only programmed while the port is VLAN-aware.
++ * their packets to match them, so VID 0 is keyed like their unicast entries:
++ * with IVL like every other VLAN on the RTL8367C, with SVL in FID 0 on the
++ * RTL8367D. The bridge PVID is only programmed while the port is VLAN-aware.
+  */
+ static int rtl8365mb_vlan_setup(struct dsa_switch *ds)
+ {
+@@ -3224,8 +3228,15 @@
+ 		if (ret)
+ 			return ret;
+ 
+-		return regmap_write(priv->map, RTL8367D_LOOKUP_HIT_ISO_ACT_REG,
+-				    RTL8367D_LOOKUP_HIT_ISO_ACT_UNKNOWN);
++		ret = regmap_write(priv->map, RTL8367D_LOOKUP_HIT_ISO_ACT_REG,
++				   RTL8367D_LOOKUP_HIT_ISO_ACT_UNKNOWN);
++		if (ret)
++			return ret;
++
++		/* VID 0 is keyed with SVL in FID 0, so no port may force its
++		 * own FID on its frames
++		 */
++		return regmap_write(priv->map, RTL8367D_PORT_PBFIDEN_REG, 0);
+ 	}
+ 
+ 	/* Common init jam */
+--- a/drivers/net/dsa/realtek/rtl8365mb_vlan.c
++++ b/drivers/net/dsa/realtek/rtl8365mb_vlan.c
+@@ -51,6 +51,7 @@
+ 
+ #include "rtl8365mb_vlan.h"
+ #include "rtl8365mb_table.h"
++#include "rtl8365mb_l2.h"
+ #include <linux/if_bridge.h>
+ #include <linux/lockdep.h>
+ #include <linux/regmap.h>
+@@ -416,9 +417,11 @@
+  *
+  * VLAN-unaware ports, both standalone and in a VLAN-unaware bridge, keep PVID
+  * 0, so their untagged and priority-tagged frames are classified to VID 0.
+- * DSA installs the FDB and MDB entries of these ports with VID 0, and this
+- * driver writes all L2 entries with IVL. VID 0 must use IVL as well, or the
+- * lookups of these frames would never hit those entries.
++ * DSA installs the FDB and MDB entries of these ports with VID 0. The VID 0
++ * entry is keyed like the unicast L2 entries of VID 0 (see rtl8365mb_l2_ivl()):
++ * IVL on the RTL8367C, SVL in FID 0 on the RTL8367D. Hardware learning and the
++ * entries installed by DSA then use the same key, whether or not the switch
++ * takes the key of VID 0 frames from this entry.
+  *
+  * VLAN-unaware ports do not filter on ingress and are transparent on egress,
+  * so the member set is not checked for them. It still includes all ports,
+@@ -437,7 +440,7 @@
+ 		.vid = 0,
+ 		.member = members,
+ 		.untag = members,
+-		.ivl_en = true,
++		.ivl_en = rtl8365mb_l2_ivl(priv, 0),
+ 	};
+ 
+ 	return rtl8365mb_vlan_4k_write(priv, &vlan4k);
