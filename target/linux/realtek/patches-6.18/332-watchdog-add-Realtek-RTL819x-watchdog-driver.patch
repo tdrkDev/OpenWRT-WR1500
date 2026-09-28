@@ -1,0 +1,38 @@
+From: Roman Rikhter <teledurak@gmail.com>
+Subject: [PATCH] watchdog: add Realtek RTL819x watchdog driver
+
+Add Kconfig and Makefile entries for the driver of the watchdog in the
+timer block of the Realtek RTL8197F router SoCs.
+
+Signed-off-by: Roman Rikhter <teledurak@gmail.com>
+---
+--- a/drivers/watchdog/Kconfig
++++ b/drivers/watchdog/Kconfig
+@@ -1077,6 +1077,17 @@ config REALTEK_OTTO_WDT
+ 
+ 	  When built as a module this will be called realtek_otto_wdt.
+ 
++config RTL819X_WDT
++	tristate "Realtek RTL819x watchdog support"
++	depends on RTL8197F || COMPILE_TEST
++	select MFD_SYSCON
++	select WATCHDOG_CORE
++	help
++	  Say Y here to include support for the watchdog timer in the timer
++	  block of Realtek RTL8197F router SoCs.
++
++	  When built as a module this will be called rtl819x_wdt.
++
+ config SPRD_WATCHDOG
+ 	tristate "Spreadtrum watchdog support"
+ 	depends on ARCH_SPRD || COMPILE_TEST
+--- a/drivers/watchdog/Makefile
++++ b/drivers/watchdog/Makefile
+@@ -185,6 +185,7 @@ obj-$(CONFIG_MT7621_WDT) += mt7621_wdt.o
+ obj-$(CONFIG_PIC32_WDT) += pic32-wdt.o
+ obj-$(CONFIG_PIC32_DMT) += pic32-dmt.o
+ obj-$(CONFIG_REALTEK_OTTO_WDT) += realtek_otto_wdt.o
++obj-$(CONFIG_RTL819X_WDT) += rtl819x_wdt.o
+ 
+ # PARISC Architecture
+ 

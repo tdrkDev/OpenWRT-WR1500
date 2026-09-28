@@ -79,11 +79,20 @@
 			compatible = "realtek,rtl8197f-timer", "syscon", "simple-mfd";
 			reg = <0x3100 0x20>;
 
-			/* Arm the watchdog with the shortest timeout, as the vendor BSP does */
+			/*
+			 * Arm the watchdog with the shortest timeout, as the vendor
+			 * BSP does, and clear the count of a running watchdog
+			 */
 			reboot {
 				compatible = "syscon-reboot";
 				offset = <0x1c>;
-				value = <0x0>;
+				value = <0x00800000>;
+			};
+
+			watchdog {
+				compatible = "realtek,rtl8197f-wdt";
+				/* The timer block counts the peripheral Lexra bus clock */
+				clock-frequency = <200000000>;
 			};
 		};
 

@@ -92,7 +92,7 @@ Signed-off-by: Manuel Stocker <mensi@mensi.ch>
  	depends on MCB
 --- a/drivers/watchdog/Makefile
 +++ b/drivers/watchdog/Makefile
-@@ -239,6 +239,7 @@ obj-$(CONFIG_NCT6694_WATCHDOG) += nct669
+@@ -240,6 +240,7 @@ obj-$(CONFIG_NCT6694_WATCHDOG) += nct669
  obj-$(CONFIG_ZIIRAVE_WATCHDOG) += ziirave_wdt.o
  obj-$(CONFIG_SOFT_WATCHDOG) += softdog.o
  obj-$(CONFIG_MENF21BMC_WATCHDOG) += menf21bmc_wdt.o
