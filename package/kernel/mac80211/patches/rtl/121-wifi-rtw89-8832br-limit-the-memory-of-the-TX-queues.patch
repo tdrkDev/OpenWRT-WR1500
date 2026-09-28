@@ -1,0 +1,39 @@
+From: Roman Rikhter <teledurak@gmail.com>
+Subject: [PATCH] wifi: rtw89: 8832br: limit the memory of the TX queues
+
+mac80211 lets the TX queues of a device hold 16 MiB when a band supports
+VHT, and 4 MiB otherwise. The RTL8832BR sits in routers: on a Cudy WR1500
+(128 MiB of RAM) 20-30 MiB are free while it runs. When TX to the
+stations can't keep up with what arrives from the other interfaces, the
+TX queues fill up to their limit, and all that memory stays with them
+for as long as the backlog lasts. Most of it is receive buffers of the
+Ethernet driver, which then has to allocate new ones while memory runs
+out.
+
+Set the memory limit of the RTL8832BR to the 4 MiB mac80211 gives HT
+devices, as mt7996 sets its own. That still lasts about 30 ms at the
+highest PHY rate of the chip, and it can be changed at run time
+("iw phy <phy> set txq memory_limit <bytes>").
+
+Signed-off-by: Roman Rikhter <teledurak@gmail.com>
+---
+diff --git drivers/net/wireless/realtek/rtw89/core.c drivers/net/wireless/realtek/rtw89/core.c
+index 94fbcdf..e4f6fb5 100644
+--- a/drivers/net/wireless/realtek/rtw89/core.c
++++ b/drivers/net/wireless/realtek/rtw89/core.c
+@@ -7474,6 +7474,15 @@ static int rtw89_core_register_hw(struct rtw89_dev *rtwdev)
+ 	hw->wiphy->tid_config_support.peer |= BIT(NL80211_TID_CONFIG_ATTR_AMSDU_CTRL);
+ 	hw->wiphy->max_remain_on_channel_duration = 1000;
+ 
++	/*
++	 * The RTL8832BR is found in routers with little memory, where the
++	 * 16 MiB that mac80211 lets the TX queues of a VHT/HE device hold is
++	 * much of what is free. The 4 MiB of HT devices still last about
++	 * 30 ms at the highest PHY rate of the chip.
++	 */
++	if (rtw89_is_rtl8832br(rtwdev))
++		hw->wiphy->txq_memory_limit = 4 << 20;
++
+ 	wiphy_ext_feature_set(hw->wiphy, NL80211_EXT_FEATURE_CAN_REPLACE_PTK0);
+ 	wiphy_ext_feature_set(hw->wiphy, NL80211_EXT_FEATURE_SCAN_RANDOM_SN);
+ 	wiphy_ext_feature_set(hw->wiphy, NL80211_EXT_FEATURE_SET_SCAN_DWELL);
