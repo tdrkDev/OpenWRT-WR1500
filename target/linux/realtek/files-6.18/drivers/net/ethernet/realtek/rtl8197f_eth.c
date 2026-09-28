@@ -598,10 +598,8 @@ static netdev_tx_t rtl8197f_eth_xmit(struct sk_buff *skb, struct net_device *nde
 	    (!netdev_uses_dsa(ndev) || rtl8197f_eth_dsa_untag(skb, &ports)))
 		goto drop;
 
-	if (skb_put_padto(skb, ETH_ZLEN)) {
-		ndev->stats.tx_dropped++;
-		return NETDEV_TX_OK;
-	}
+	if (skb_put_padto(skb, ETH_ZLEN))
+		goto dropped;
 
 	nr_frags = skb_shinfo(skb)->nr_frags;
 	if (unlikely(rtl8197f_eth_tx_free(eth) < nr_frags + 1)) {
@@ -700,7 +698,14 @@ unmap:
 		rtl8197f_eth_tx_unmap(eth, &eth->tx_buf[idx % RTL8197F_ETH_TX_RING]);
 drop:
 	dev_kfree_skb_any(skb);
+dropped:
 	ndev->stats.tx_dropped++;
+
+	/* Frames queued before this one may still wait for the kick */
+	if (!netdev_xmit_more()) {
+		wmb();
+		nic_rmw(eth, NIC_CPUICR, 0, NIC_CPUICR_TXFD);
+	}
 
 	return NETDEV_TX_OK;
 }
