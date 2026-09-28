@@ -47,8 +47,14 @@ def tftp_put(data, host, filename, timeout=2.0, retries=8):
             if op == TFTP_ACK and blk == 0:
                 break
         else:
-            raise RuntimeError("No answer from TFTP server %s. Router in recovery mode? "
-                               "Cable on a LAN port? Host on the same subnet?" % host)
+            raise RuntimeError(
+                "No answer from %s. Check that:\n"
+                "  - the router is in recovery mode (LED blue+red),\n"
+                "  - the cable is in the router's WAN port,\n"
+                "  - this computer has a static 192.168.1.x/24 address on that adapter\n"
+                "    and Wi-Fi/other networks are off (above all if they use 192.168.1.x),\n"
+                "  - on Windows, Python is allowed in the firewall.\n"
+                "Then run it again: the first try after powering on sometimes fails." % host)
 
         block, off = 1, 0
         t0 = time.time()
@@ -98,7 +104,7 @@ def check_host_ip(router_ip):
         return
     net = router_ip.rsplit(".", 1)[0] + "."
     if local.startswith(net):
-        print("Host address: %s" % local)
+        print("Host address: %s (must be the adapter wired to the router)" % local)
     else:
         print("WARNING: route to %s uses %s, not a %sx address; TFTP will likely fail.\n"
               "  Give this computer e.g. %s50/24 on the interface wired to the router."
@@ -123,6 +129,10 @@ def main():
         img = f.read()
     if not img:
         sys.exit("Image is empty: %s" % args.image)
+    if args.name == DEFAULT_NAME and img[0x1FC00:0x1FC08] != b"OEM_BOOT":
+        print("WARNING: %s is not a recovery image (no OEM_BOOT marker at 0x1FC00);\n"
+              "  the router will most likely ignore it. Send the *-squashfs-recovery.bin."
+              % args.image)
 
     print("Image: %s (%d bytes)" % (args.image, len(img)))
     check_host_ip(args.router_ip)
@@ -134,6 +144,10 @@ def main():
     except KeyboardInterrupt:
         sys.exit("\ninterrupted")
     print("sent %d bytes to %s" % (sent, args.router_ip))
+    print("\nThe router now writes the image to flash and reboots by itself: don't power it off.\n"
+          "The first boot takes a few minutes; with OpenWrt the LED turns blue when it's ready.\n"
+          "Then set this computer back to automatic IP (DHCP), move the cable to a LAN port\n"
+          "and open http://192.168.1.1 (user root, no password).")
 
 
 if __name__ == "__main__":

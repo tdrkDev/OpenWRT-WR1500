@@ -5,7 +5,8 @@ setlocal
 set "DIR=%~dp0"
 
 if not exist "%DIR%recovery.bin" (
-    echo recovery.bin not found in %DIR%
+    echo recovery.bin not found in "%DIR%"
+    echo Extract the whole ZIP first and run tftp.bat from the extracted folder.
     goto fail
 )
 

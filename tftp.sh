@@ -4,7 +4,7 @@
 DIR=$(cd "$(dirname "$0")" && pwd)
 
 if [ ! -f "$DIR/recovery.bin" ]; then
-    echo "recovery.bin not found in $DIR" >&2
+    echo "recovery.bin not found in $DIR: unpack the whole ZIP and run this script from there." >&2
     exit 1
 fi
 
@@ -15,5 +15,5 @@ for PY in python3 python; do
     fi
 done
 
-echo "Python 3.7+ is required (python3 not found)." >&2
+echo "Python 3.7+ is required: https://www.python.org/downloads/ (on macOS also: xcode-select --install)" >&2
 exit 1
