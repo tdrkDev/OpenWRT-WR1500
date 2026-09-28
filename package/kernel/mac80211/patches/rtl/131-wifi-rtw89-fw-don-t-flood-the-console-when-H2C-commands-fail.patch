@@ -1,0 +1,1993 @@
+From: Roman Rikhter <teledurak@gmail.com>
+Subject: [PATCH] wifi: rtw89: fw: don't flood the console when H2C commands
+ fail
+
+When memory runs short, or the ring for firmware commands is full, the
+H2C commands that the track work and the coexistence code send every two
+seconds fail, and each one prints "failed to alloc skb for ..." or
+"failed to send h2c" at error level, without a limit. On a router with a
+38400 Bd serial console each line keeps interrupts off for 20-30 ms,
+and error level reaches the console at any usual console log level.
+
+Print these two messages with the rate limit of the data path.
+
+Signed-off-by: Roman Rikhter <teledurak@gmail.com>
+---
+diff --git drivers/net/wireless/realtek/rtw89/fw.c drivers/net/wireless/realtek/rtw89/fw.c
+index 26ca7bd..ed022e8 100644
+--- a/drivers/net/wireless/realtek/rtw89/fw.c
++++ b/drivers/net/wireless/realtek/rtw89/fw.c
+@@ -1722,7 +1722,7 @@ static int __rtw89_fw_download_hdr(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for fw hdr dl\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for fw hdr dl\n");
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -1753,7 +1753,7 @@ static int __rtw89_fw_download_hdr(struct rtw89_dev *rtwdev,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -1826,7 +1826,7 @@ static int __rtw89_fw_download_main(struct rtw89_dev *rtwdev,
+ 
+ 		skb = rtw89_fw_h2c_alloc_skb_no_hdr(rtwdev, pkt_len);
+ 		if (!skb) {
+-			rtw89_err(rtwdev, "failed to alloc skb for fw dl\n");
++			rtw89_err_ratelimited(rtwdev, "failed to alloc skb for fw dl\n");
+ 			return -ENOMEM;
+ 		}
+ 		skb_put_data(skb, section, pkt_len);
+@@ -1837,7 +1837,7 @@ static int __rtw89_fw_download_main(struct rtw89_dev *rtwdev,
+ 
+ 		ret = rtw89_h2c_tx(rtwdev, skb, true);
+ 		if (ret) {
+-			rtw89_err(rtwdev, "failed to send h2c\n");
++			rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 			goto fail;
+ 		}
+ 
+@@ -2288,7 +2288,7 @@ int rtw89_fw_h2c_cam(struct rtw89_dev *rtwdev, struct rtw89_vif_link *rtwvif_lin
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for fw dl\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for fw dl\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -2313,7 +2313,7 @@ hdr:
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -2335,7 +2335,7 @@ int rtw89_fw_h2c_dctl_sec_cam_v1(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for dctl sec cam\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for dctl sec cam\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -2351,7 +2351,7 @@ int rtw89_fw_h2c_dctl_sec_cam_v1(struct rtw89_dev *rtwdev,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -2374,7 +2374,7 @@ int rtw89_fw_h2c_dctl_sec_cam_v2(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for dctl sec cam\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for dctl sec cam\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -2390,7 +2390,7 @@ int rtw89_fw_h2c_dctl_sec_cam_v2(struct rtw89_dev *rtwdev,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -2413,7 +2413,7 @@ int rtw89_fw_h2c_dctl_sec_cam_v3(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for dctl sec cam\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for dctl sec cam\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -2429,7 +2429,7 @@ int rtw89_fw_h2c_dctl_sec_cam_v3(struct rtw89_dev *rtwdev,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -2453,7 +2453,7 @@ int rtw89_fw_h2c_default_dmac_tbl_v2(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for dctl v2\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for dctl v2\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -2484,7 +2484,7 @@ int rtw89_fw_h2c_default_dmac_tbl_v2(struct rtw89_dev *rtwdev,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -2508,7 +2508,7 @@ int rtw89_fw_h2c_default_dmac_tbl_v3(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for dctl v2\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for dctl v2\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -2540,7 +2540,7 @@ int rtw89_fw_h2c_default_dmac_tbl_v3(struct rtw89_dev *rtwdev,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -2582,7 +2582,7 @@ int rtw89_fw_h2c_ba_cam(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c ba cam\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c ba cam\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -2620,7 +2620,7 @@ end:
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -2642,7 +2642,7 @@ static int rtw89_fw_h2c_init_ba_cam_v0_ext(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for dynamic h2c ba cam\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for dynamic h2c ba cam\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -2662,7 +2662,7 @@ static int rtw89_fw_h2c_init_ba_cam_v0_ext(struct rtw89_dev *rtwdev,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -2718,7 +2718,7 @@ int rtw89_fw_h2c_ba_cam_v1(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c ba cam\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c ba cam\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -2754,7 +2754,7 @@ int rtw89_fw_h2c_ba_cam_v1(struct rtw89_dev *rtwdev,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -2776,7 +2776,7 @@ int rtw89_fw_h2c_init_ba_cam_users(struct rtw89_dev *rtwdev, u8 users,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c ba cam init\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c ba cam init\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -2794,7 +2794,7 @@ int rtw89_fw_h2c_init_ba_cam_users(struct rtw89_dev *rtwdev, u8 users,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -2819,7 +2819,7 @@ int rtw89_fw_h2c_fw_log(struct rtw89_dev *rtwdev, bool enable)
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, H2C_LOG_CFG_LEN);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for fw log cfg\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for fw log cfg\n");
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -2837,7 +2837,7 @@ int rtw89_fw_h2c_fw_log(struct rtw89_dev *rtwdev, bool enable)
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -3093,7 +3093,7 @@ int rtw89_fw_h2c_general_pkt(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, H2C_GENERAL_PKT_LEN);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for fw dl\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for fw dl\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, H2C_GENERAL_PKT_LEN);
+@@ -3112,7 +3112,7 @@ int rtw89_fw_h2c_general_pkt(struct rtw89_dev *rtwdev,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -3138,7 +3138,7 @@ int rtw89_fw_h2c_lps_parm(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, H2C_LPS_PARM_LEN);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for fw dl\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for fw dl\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, H2C_LPS_PARM_LEN);
+@@ -3162,7 +3162,7 @@ int rtw89_fw_h2c_lps_parm(struct rtw89_dev *rtwdev,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -3192,7 +3192,7 @@ int rtw89_fw_h2c_lps_ch_info(struct rtw89_dev *rtwdev, struct rtw89_vif *rtwvif)
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c lps_ch_info\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c lps_ch_info\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -3227,7 +3227,7 @@ int rtw89_fw_h2c_lps_ch_info(struct rtw89_dev *rtwdev, struct rtw89_vif *rtwvif)
+ 	rtw89_phy_write32_mask(rtwdev, R_CHK_LPS_STAT, B_CHK_LPS_STAT, 0);
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -3271,7 +3271,7 @@ int rtw89_fw_h2c_lps_ml_cmn_info(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c lps_ml_cmn_info\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c lps_ml_cmn_info\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -3328,7 +3328,7 @@ int rtw89_fw_h2c_lps_ml_cmn_info(struct rtw89_dev *rtwdev,
+ 	rtw89_phy_write32_mask(rtwdev, R_CHK_LPS_STAT, B_CHK_LPS_STAT, 0);
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -3437,7 +3437,7 @@ int rtw89_fw_h2c_lps_ml_cmn_info_v1(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c lps_ml_cmn_info_v1\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c lps_ml_cmn_info_v1\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -3483,7 +3483,7 @@ int rtw89_fw_h2c_lps_ml_cmn_info_v1(struct rtw89_dev *rtwdev,
+ 	rtw89_phy_write32_mask(rtwdev, R_CHK_LPS_STAT_BE4, B_CHK_LPS_STAT, 0);
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -3512,7 +3512,7 @@ int rtw89_fw_h2c_p2p_act(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, H2C_P2P_ACT_LEN);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c p2p act\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c p2p act\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, H2C_P2P_ACT_LEN);
+@@ -3539,7 +3539,7 @@ int rtw89_fw_h2c_p2p_act(struct rtw89_dev *rtwdev,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -3585,7 +3585,7 @@ int rtw89_fw_h2c_default_cmac_tbl(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, H2C_CMC_TBL_LEN);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for fw dl\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for fw dl\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, H2C_CMC_TBL_LEN);
+@@ -3612,7 +3612,7 @@ int rtw89_fw_h2c_default_cmac_tbl(struct rtw89_dev *rtwdev,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -3636,7 +3636,7 @@ int rtw89_fw_h2c_default_cmac_tbl_g7(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for cmac g7\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for cmac g7\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -3697,7 +3697,7 @@ int rtw89_fw_h2c_default_cmac_tbl_g7(struct rtw89_dev *rtwdev,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -3722,7 +3722,7 @@ int rtw89_fw_h2c_default_cmac_tbl_be(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for default cmac be\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for default cmac be\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -3783,7 +3783,7 @@ int rtw89_fw_h2c_default_cmac_tbl_be(struct rtw89_dev *rtwdev,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -3869,7 +3869,7 @@ int rtw89_fw_h2c_assoc_cmac_tbl(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, H2C_CMC_TBL_LEN);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for fw dl\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for fw dl\n");
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -3927,7 +3927,7 @@ int rtw89_fw_h2c_assoc_cmac_tbl(struct rtw89_dev *rtwdev,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -4017,7 +4017,7 @@ int rtw89_fw_h2c_assoc_cmac_tbl_g7(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for cmac g7\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for cmac g7\n");
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -4113,7 +4113,7 @@ int rtw89_fw_h2c_assoc_cmac_tbl_g7(struct rtw89_dev *rtwdev,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -4145,7 +4145,7 @@ int rtw89_fw_h2c_assoc_cmac_tbl_be(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for assoc cmac be\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for assoc cmac be\n");
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -4241,7 +4241,7 @@ int rtw89_fw_h2c_assoc_cmac_tbl_be(struct rtw89_dev *rtwdev,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -4268,7 +4268,7 @@ int rtw89_fw_h2c_ampdu_cmac_tbl_g7(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for ampdu cmac g7\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for ampdu cmac g7\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -4307,7 +4307,7 @@ int rtw89_fw_h2c_ampdu_cmac_tbl_g7(struct rtw89_dev *rtwdev,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -4334,7 +4334,7 @@ int rtw89_fw_h2c_ampdu_cmac_tbl_be(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for ampdu cmac be\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for ampdu cmac be\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -4373,7 +4373,7 @@ int rtw89_fw_h2c_ampdu_cmac_tbl_be(struct rtw89_dev *rtwdev,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -4394,7 +4394,7 @@ int rtw89_fw_h2c_txtime_cmac_tbl(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, H2C_CMC_TBL_LEN);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for fw dl\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for fw dl\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, H2C_CMC_TBL_LEN);
+@@ -4416,7 +4416,7 @@ int rtw89_fw_h2c_txtime_cmac_tbl(struct rtw89_dev *rtwdev,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -4438,7 +4438,7 @@ int rtw89_fw_h2c_txtime_cmac_tbl_g7(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for txtime_cmac_g7\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for txtime_cmac_g7\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -4470,7 +4470,7 @@ int rtw89_fw_h2c_txtime_cmac_tbl_g7(struct rtw89_dev *rtwdev,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -4492,7 +4492,7 @@ int rtw89_fw_h2c_txtime_cmac_tbl_be(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for txtime_cmac_be\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for txtime_cmac_be\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -4524,7 +4524,7 @@ int rtw89_fw_h2c_txtime_cmac_tbl_be(struct rtw89_dev *rtwdev,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -4547,7 +4547,7 @@ int rtw89_fw_h2c_punctured_cmac_tbl_g7(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for punctured cmac g7\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for punctured cmac g7\n");
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -4567,7 +4567,7 @@ int rtw89_fw_h2c_punctured_cmac_tbl_g7(struct rtw89_dev *rtwdev,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -4590,7 +4590,7 @@ int rtw89_fw_h2c_punctured_cmac_tbl_be(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for punctured cmac be\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for punctured cmac be\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -4609,7 +4609,7 @@ int rtw89_fw_h2c_punctured_cmac_tbl_be(struct rtw89_dev *rtwdev,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -4633,7 +4633,7 @@ int rtw89_fw_h2c_txpath_cmac_tbl(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, H2C_CMC_TBL_LEN);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for fw dl\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for fw dl\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, H2C_CMC_TBL_LEN);
+@@ -4649,7 +4649,7 @@ int rtw89_fw_h2c_txpath_cmac_tbl(struct rtw89_dev *rtwdev,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -4705,7 +4705,7 @@ int rtw89_fw_h2c_update_beacon(struct rtw89_dev *rtwdev,
+ 	bcn_total_len = len + skb_beacon->len;
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, bcn_total_len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for fw dl\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for fw dl\n");
+ 		dev_kfree_skb_any(skb_beacon);
+ 		return -ENOMEM;
+ 	}
+@@ -4731,7 +4731,7 @@ int rtw89_fw_h2c_update_beacon(struct rtw89_dev *rtwdev,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		dev_kfree_skb_any(skb);
+ 		return ret;
+ 	}
+@@ -4784,7 +4784,7 @@ int rtw89_fw_h2c_update_beacon_be(struct rtw89_dev *rtwdev,
+ 	bcn_total_len = len + skb_beacon->len;
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, bcn_total_len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for fw dl\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for fw dl\n");
+ 		dev_kfree_skb_any(skb_beacon);
+ 		return -ENOMEM;
+ 	}
+@@ -4810,7 +4810,7 @@ int rtw89_fw_h2c_update_beacon_be(struct rtw89_dev *rtwdev,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -4833,7 +4833,7 @@ int rtw89_fw_h2c_tbtt_tuning(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c tbtt tuning\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c tbtt tuning\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -4850,7 +4850,7 @@ int rtw89_fw_h2c_tbtt_tuning(struct rtw89_dev *rtwdev,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -4876,7 +4876,7 @@ int rtw89_fw_h2c_pwr_lvl(struct rtw89_dev *rtwdev, struct rtw89_vif_link *rtwvif
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c pwr lvl\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c pwr lvl\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -4899,7 +4899,7 @@ int rtw89_fw_h2c_pwr_lvl(struct rtw89_dev *rtwdev, struct rtw89_vif_link *rtwvif
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -4933,7 +4933,7 @@ int rtw89_fw_h2c_role_maintain(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c join\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c join\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -4955,7 +4955,7 @@ int rtw89_fw_h2c_role_maintain(struct rtw89_dev *rtwdev,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -5036,7 +5036,7 @@ int rtw89_fw_h2c_join_info(struct rtw89_dev *rtwdev, struct rtw89_vif_link *rtwv
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c join\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c join\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -5095,7 +5095,7 @@ done:
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -5115,7 +5115,7 @@ int rtw89_fw_h2c_notify_dbcc(struct rtw89_dev *rtwdev, bool en)
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c notify dbcc\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c notify dbcc\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -5130,7 +5130,7 @@ int rtw89_fw_h2c_notify_dbcc(struct rtw89_dev *rtwdev, bool en)
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -5162,7 +5162,7 @@ int rtw89_fw_h2c_macid_pause(struct rtw89_dev *rtwdev, u8 sh, u8 grp,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c macid pause\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c macid pause\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -5191,7 +5191,7 @@ int rtw89_fw_h2c_macid_pause(struct rtw89_dev *rtwdev, u8 sh, u8 grp,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -5211,7 +5211,7 @@ int rtw89_fw_h2c_set_edca(struct rtw89_dev *rtwdev, struct rtw89_vif_link *rtwvi
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, H2C_EDCA_LEN);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c edca\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c edca\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, H2C_EDCA_LEN);
+@@ -5228,7 +5228,7 @@ int rtw89_fw_h2c_set_edca(struct rtw89_dev *rtwdev, struct rtw89_vif_link *rtwvi
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -5251,7 +5251,7 @@ int rtw89_fw_h2c_tsf32_toggle(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, H2C_TSF32_TOGL_LEN);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c p2p act\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c p2p act\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, H2C_TSF32_TOGL_LEN);
+@@ -5269,7 +5269,7 @@ int rtw89_fw_h2c_tsf32_toggle(struct rtw89_dev *rtwdev,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -5289,7 +5289,7 @@ int rtw89_fw_h2c_set_ofld_cfg(struct rtw89_dev *rtwdev)
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, H2C_OFLD_CFG_LEN);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c ofld\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c ofld\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put_data(skb, cfg, H2C_OFLD_CFG_LEN);
+@@ -5301,7 +5301,7 @@ int rtw89_fw_h2c_set_ofld_cfg(struct rtw89_dev *rtwdev)
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -5322,7 +5322,7 @@ int rtw89_fw_h2c_tx_duty(struct rtw89_dev *rtwdev, u8 lv)
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c tx duty\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c tx duty\n");
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -5347,7 +5347,7 @@ int rtw89_fw_h2c_tx_duty(struct rtw89_dev *rtwdev, u8 lv)
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -5390,7 +5390,7 @@ int rtw89_fw_h2c_set_bcn_fltr_cfg(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c bcn filter\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c bcn filter\n");
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -5422,7 +5422,7 @@ int rtw89_fw_h2c_set_bcn_fltr_cfg(struct rtw89_dev *rtwdev,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -5450,7 +5450,7 @@ int rtw89_fw_h2c_rssi_offload(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c rssi\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c rssi\n");
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -5468,7 +5468,7 @@ int rtw89_fw_h2c_rssi_offload(struct rtw89_dev *rtwdev,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -5493,7 +5493,7 @@ int rtw89_fw_h2c_tp_offload(struct rtw89_dev *rtwdev, struct rtw89_vif_link *rtw
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c tp\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c tp\n");
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -5510,7 +5510,7 @@ int rtw89_fw_h2c_tp_offload(struct rtw89_dev *rtwdev, struct rtw89_vif_link *rtw
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -5541,7 +5541,7 @@ int rtw89_fw_h2c_ra(struct rtw89_dev *rtwdev, struct rtw89_ra_info *ra, bool csi
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c join\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c join\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -5601,7 +5601,7 @@ done:
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -5626,7 +5626,7 @@ int rtw89_fw_h2c_tx_history(struct rtw89_dev *rtwdev, u16 mac_id)
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c tx history\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c tx history\n");
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -5642,7 +5642,7 @@ int rtw89_fw_h2c_tx_history(struct rtw89_dev *rtwdev, u16 mac_id)
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -5668,7 +5668,7 @@ int rtw89_fw_h2c_phy_ch_rpt(struct rtw89_dev *rtwdev)
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c phy ch rpt\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c phy ch rpt\n");
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -5683,7 +5683,7 @@ int rtw89_fw_h2c_phy_ch_rpt(struct rtw89_dev *rtwdev)
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -5707,7 +5707,7 @@ int rtw89_fw_h2c_drv_ctrl_fw(struct rtw89_dev *rtwdev)
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c drv ctrl fw\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c drv ctrl fw\n");
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -5722,7 +5722,7 @@ int rtw89_fw_h2c_drv_ctrl_fw(struct rtw89_dev *rtwdev)
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -5747,7 +5747,7 @@ int rtw89_fw_h2c_cxdrv_init(struct rtw89_dev *rtwdev, u8 type)
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c cxdrv_init\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c cxdrv_init\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -5789,7 +5789,7 @@ int rtw89_fw_h2c_cxdrv_init(struct rtw89_dev *rtwdev, u8 type)
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -5812,7 +5812,7 @@ int rtw89_fw_h2c_cxdrv_init_v7(struct rtw89_dev *rtwdev, u8 type)
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c cxdrv_init_v7\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c cxdrv_init_v7\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -5830,7 +5830,7 @@ int rtw89_fw_h2c_cxdrv_init_v7(struct rtw89_dev *rtwdev, u8 type)
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -5865,7 +5865,7 @@ int rtw89_fw_h2c_cxdrv_role(struct rtw89_dev *rtwdev, u8 type)
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c cxdrv_role\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c cxdrv_role\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -5913,7 +5913,7 @@ int rtw89_fw_h2c_cxdrv_role(struct rtw89_dev *rtwdev, u8 type)
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -5945,7 +5945,7 @@ int rtw89_fw_h2c_cxdrv_role_v1(struct rtw89_dev *rtwdev, u8 type)
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c cxdrv_role\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c cxdrv_role\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -6003,7 +6003,7 @@ int rtw89_fw_h2c_cxdrv_role_v1(struct rtw89_dev *rtwdev, u8 type)
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -6035,7 +6035,7 @@ int rtw89_fw_h2c_cxdrv_role_v2(struct rtw89_dev *rtwdev, u8 type)
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c cxdrv_role\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c cxdrv_role\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -6089,7 +6089,7 @@ int rtw89_fw_h2c_cxdrv_role_v2(struct rtw89_dev *rtwdev, u8 type)
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -6111,7 +6111,7 @@ int rtw89_fw_h2c_cxdrv_role_v7(struct rtw89_dev *rtwdev, u8 type)
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c cxdrv_ctrl\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c cxdrv_ctrl\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -6135,7 +6135,7 @@ int rtw89_fw_h2c_cxdrv_role_v7(struct rtw89_dev *rtwdev, u8 type)
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -6157,7 +6157,7 @@ int rtw89_fw_h2c_cxdrv_role_v8(struct rtw89_dev *rtwdev, u8 type)
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c cxdrv_ctrl\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c cxdrv_ctrl\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -6178,7 +6178,7 @@ int rtw89_fw_h2c_cxdrv_role_v8(struct rtw89_dev *rtwdev, u8 type)
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -6200,7 +6200,7 @@ int rtw89_fw_h2c_cxdrv_osi_info(struct rtw89_dev *rtwdev, u8 type)
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c cxdrv_osi\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c cxdrv_osi\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -6218,7 +6218,7 @@ int rtw89_fw_h2c_cxdrv_osi_info(struct rtw89_dev *rtwdev, u8 type)
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -6241,7 +6241,7 @@ int rtw89_fw_h2c_cxdrv_ctrl(struct rtw89_dev *rtwdev, u8 type)
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, H2C_LEN_CXDRVINFO_CTRL);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c cxdrv_ctrl\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c cxdrv_ctrl\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, H2C_LEN_CXDRVINFO_CTRL);
+@@ -6263,7 +6263,7 @@ int rtw89_fw_h2c_cxdrv_ctrl(struct rtw89_dev *rtwdev, u8 type)
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -6285,7 +6285,7 @@ int rtw89_fw_h2c_cxdrv_ctrl_v7(struct rtw89_dev *rtwdev, u8 type)
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c cxdrv_ctrl_v7\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c cxdrv_ctrl_v7\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -6302,7 +6302,7 @@ int rtw89_fw_h2c_cxdrv_ctrl_v7(struct rtw89_dev *rtwdev, u8 type)
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -6324,7 +6324,7 @@ int rtw89_fw_h2c_cxdrv_trx(struct rtw89_dev *rtwdev, u8 type)
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, H2C_LEN_CXDRVINFO_TRX);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c cxdrv_trx\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c cxdrv_trx\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, H2C_LEN_CXDRVINFO_TRX);
+@@ -6358,7 +6358,7 @@ int rtw89_fw_h2c_cxdrv_trx(struct rtw89_dev *rtwdev, u8 type)
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -6381,7 +6381,7 @@ int rtw89_fw_h2c_cxdrv_rfk(struct rtw89_dev *rtwdev, u8 type)
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, H2C_LEN_CXDRVINFO_RFK);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c cxdrv_ctrl\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c cxdrv_ctrl\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, H2C_LEN_CXDRVINFO_RFK);
+@@ -6403,7 +6403,7 @@ int rtw89_fw_h2c_cxdrv_rfk(struct rtw89_dev *rtwdev, u8 type)
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -6425,7 +6425,7 @@ int rtw89_fw_h2c_del_pkt_offload(struct rtw89_dev *rtwdev, u8 id)
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, H2C_LEN_PKT_OFLD);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c pkt offload\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c pkt offload\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, H2C_LEN_PKT_OFLD);
+@@ -6472,7 +6472,7 @@ int rtw89_fw_h2c_add_pkt_offload(struct rtw89_dev *rtwdev, u8 *id,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, H2C_LEN_PKT_OFLD + skb_ofld->len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c pkt offload\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c pkt offload\n");
+ 		rtw89_core_release_bit_map(rtwdev->pkt_offload, alloc_id);
+ 		return -ENOMEM;
+ 	}
+@@ -6522,7 +6522,7 @@ int rtw89_fw_h2c_scan_list_offload_ax(struct rtw89_dev *rtwdev, int ch_num,
+ 	skb_len = struct_size(h2c, elem, ch_num);
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, skb_len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c scan list\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c scan list\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, sizeof(*h2c));
+@@ -6600,7 +6600,7 @@ int rtw89_fw_h2c_scan_list_offload_be(struct rtw89_dev *rtwdev, int ch_num,
+ 	skb_len = struct_size(h2c, elem, ch_num);
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, skb_len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c scan list\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c scan list\n");
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -6706,7 +6706,7 @@ int rtw89_fw_h2c_scan_offload_ax(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c scan offload\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c scan offload\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -6847,7 +6847,7 @@ int rtw89_fw_h2c_scan_offload_be(struct rtw89_dev *rtwdev,
+ 	len = cfg_len + macc_role_size + opch_size;
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c scan offload\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c scan offload\n");
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -7049,7 +7049,7 @@ int rtw89_fw_h2c_trx_protect(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c trx protect\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c trx protect\n");
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -7132,7 +7132,7 @@ int rtw89_fw_h2c_rf_reg(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c rf reg\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c rf reg\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put_data(skb, info->rtw89_phy_config_rf_h2c[page], len);
+@@ -7143,7 +7143,7 @@ int rtw89_fw_h2c_rf_reg(struct rtw89_dev *rtwdev,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -7172,7 +7172,7 @@ int rtw89_fw_h2c_rf_ntfy_mcc(struct rtw89_dev *rtwdev)
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c cxdrv_ctrl\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c cxdrv_ctrl\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -7202,7 +7202,7 @@ int rtw89_fw_h2c_rf_ntfy_mcc(struct rtw89_dev *rtwdev)
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -7227,7 +7227,7 @@ int rtw89_fw_h2c_mcc_dig(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c mcc_dig\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c mcc_dig\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -7256,7 +7256,7 @@ int rtw89_fw_h2c_mcc_dig(struct rtw89_dev *rtwdev,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -7285,7 +7285,7 @@ int rtw89_fw_h2c_rf_ps_info(struct rtw89_dev *rtwdev, struct rtw89_vif *rtwvif)
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c rf ps info\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c rf ps info\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -7314,7 +7314,7 @@ int rtw89_fw_h2c_rf_ps_info(struct rtw89_dev *rtwdev, struct rtw89_vif *rtwvif)
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -7357,7 +7357,7 @@ int rtw89_fw_h2c_rf_pre_ntfy(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c rfk_pre_ntfy\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c rfk_pre_ntfy\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -7444,7 +7444,7 @@ done:
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -7481,7 +7481,7 @@ int rtw89_fw_h2c_rf_pre_ntfy_mcc(struct rtw89_dev *rtwdev, enum rtw89_phy_idx ph
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c rfk_pre_ntfy_mcc\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c rfk_pre_ntfy_mcc\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -7543,7 +7543,7 @@ done:
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -7567,7 +7567,7 @@ int rtw89_fw_h2c_rf_tssi(struct rtw89_dev *rtwdev, enum rtw89_phy_idx phy_idx,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c RF TSSI\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c RF TSSI\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -7596,7 +7596,7 @@ int rtw89_fw_h2c_rf_tssi(struct rtw89_dev *rtwdev, enum rtw89_phy_idx phy_idx,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -7625,7 +7625,7 @@ int rtw89_fw_h2c_rf_iqk(struct rtw89_dev *rtwdev, enum rtw89_phy_idx phy_idx,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c RF IQK\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c RF IQK\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -7657,7 +7657,7 @@ done:
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -7678,7 +7678,7 @@ int rtw89_fw_h2c_rf_dpk(struct rtw89_dev *rtwdev, enum rtw89_phy_idx phy_idx,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c RF DPK\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c RF DPK\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -7699,7 +7699,7 @@ int rtw89_fw_h2c_rf_dpk(struct rtw89_dev *rtwdev, enum rtw89_phy_idx phy_idx,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -7721,7 +7721,7 @@ int rtw89_fw_h2c_rf_txgapk(struct rtw89_dev *rtwdev, enum rtw89_phy_idx phy_idx,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c RF TXGAPK\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c RF TXGAPK\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -7742,7 +7742,7 @@ int rtw89_fw_h2c_rf_txgapk(struct rtw89_dev *rtwdev, enum rtw89_phy_idx phy_idx,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -7763,7 +7763,7 @@ int rtw89_fw_h2c_rf_dack(struct rtw89_dev *rtwdev, enum rtw89_phy_idx phy_idx,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c RF DACK\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c RF DACK\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -7779,7 +7779,7 @@ int rtw89_fw_h2c_rf_dack(struct rtw89_dev *rtwdev, enum rtw89_phy_idx phy_idx,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -7807,7 +7807,7 @@ int rtw89_fw_h2c_rf_rxdck(struct rtw89_dev *rtwdev, enum rtw89_phy_idx phy_idx,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c RF RXDCK\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c RF RXDCK\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -7835,7 +7835,7 @@ hdr:
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -7855,7 +7855,7 @@ int rtw89_fw_h2c_rf_tas_trigger(struct rtw89_dev *rtwdev, bool enable)
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c RF TAS\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c RF TAS\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -7869,7 +7869,7 @@ int rtw89_fw_h2c_rf_tas_trigger(struct rtw89_dev *rtwdev, bool enable)
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -7890,7 +7890,7 @@ int rtw89_fw_h2c_rf_txiqk(struct rtw89_dev *rtwdev, enum rtw89_phy_idx phy_idx,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c RF TXIQK\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c RF TXIQK\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -7912,7 +7912,7 @@ int rtw89_fw_h2c_rf_txiqk(struct rtw89_dev *rtwdev, enum rtw89_phy_idx phy_idx,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -7933,7 +7933,7 @@ int rtw89_fw_h2c_rf_cim3k(struct rtw89_dev *rtwdev, enum rtw89_phy_idx phy_idx,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c RF CIM3K\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c RF CIM3K\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -7953,7 +7953,7 @@ int rtw89_fw_h2c_rf_cim3k(struct rtw89_dev *rtwdev, enum rtw89_phy_idx phy_idx,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -7973,7 +7973,7 @@ int rtw89_fw_h2c_raw_with_hdr(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for raw with hdr\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for raw with hdr\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put_data(skb, buf, len);
+@@ -7984,7 +7984,7 @@ int rtw89_fw_h2c_raw_with_hdr(struct rtw89_dev *rtwdev,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -8002,14 +8002,14 @@ int rtw89_fw_h2c_raw(struct rtw89_dev *rtwdev, const u8 *buf, u16 len)
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_no_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for h2c raw\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for h2c raw\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put_data(skb, buf, len);
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -9540,8 +9540,8 @@ int rtw89_fw_h2c_trigger_cpu_exception(struct rtw89_dev *rtwdev)
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev,
+-			  "failed to alloc skb for fw cpu exception\n");
++		rtw89_err_ratelimited(rtwdev,
++				      "failed to alloc skb for fw cpu exception\n");
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -9559,7 +9559,7 @@ int rtw89_fw_h2c_trigger_cpu_exception(struct rtw89_dev *rtwdev)
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		dev_kfree_skb_any(skb);
+ 		return ret;
+ 	}
+@@ -9576,8 +9576,8 @@ int rtw89_fw_h2c_pkt_drop(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, H2C_PKT_DROP_LEN);
+ 	if (!skb) {
+-		rtw89_err(rtwdev,
+-			  "failed to alloc skb for packet drop\n");
++		rtw89_err_ratelimited(rtwdev,
++				      "failed to alloc skb for packet drop\n");
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -9619,7 +9619,7 @@ int rtw89_fw_h2c_pkt_drop(struct rtw89_dev *rtwdev,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -9648,7 +9648,7 @@ int rtw89_fw_h2c_keep_alive(struct rtw89_dev *rtwdev, struct rtw89_vif_link *rtw
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, H2C_KEEP_ALIVE_LEN);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for keep alive\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for keep alive\n");
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -9667,7 +9667,7 @@ int rtw89_fw_h2c_keep_alive(struct rtw89_dev *rtwdev, struct rtw89_vif_link *rtw
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -9698,7 +9698,7 @@ int rtw89_fw_h2c_arp_offload(struct rtw89_dev *rtwdev, struct rtw89_vif_link *rt
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for arp offload\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for arp offload\n");
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -9718,7 +9718,7 @@ int rtw89_fw_h2c_arp_offload(struct rtw89_dev *rtwdev, struct rtw89_vif_link *rt
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -9741,7 +9741,7 @@ int rtw89_fw_h2c_disconnect_detect(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, H2C_DISCONNECT_DETECT_LEN);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for keep alive\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for keep alive\n");
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -9763,7 +9763,7 @@ int rtw89_fw_h2c_disconnect_detect(struct rtw89_dev *rtwdev,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -9787,7 +9787,7 @@ int rtw89_fw_h2c_cfg_pno(struct rtw89_dev *rtwdev, struct rtw89_vif_link *rtwvif
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for nlo\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for nlo\n");
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -9815,7 +9815,7 @@ int rtw89_fw_h2c_cfg_pno(struct rtw89_dev *rtwdev, struct rtw89_vif_link *rtwvif
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -9838,7 +9838,7 @@ int rtw89_fw_h2c_wow_global(struct rtw89_dev *rtwdev, struct rtw89_vif_link *rtw
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for wow global\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for wow global\n");
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -9861,7 +9861,7 @@ int rtw89_fw_h2c_wow_global(struct rtw89_dev *rtwdev, struct rtw89_vif_link *rtw
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -9887,7 +9887,7 @@ int rtw89_fw_h2c_wow_wakeup_ctrl(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for wakeup ctrl\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for wakeup ctrl\n");
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -9919,7 +9919,7 @@ int rtw89_fw_h2c_wow_wakeup_ctrl(struct rtw89_dev *rtwdev,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -9941,7 +9941,7 @@ int rtw89_fw_h2c_wow_cam_update(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for wow cam update\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for wow cam update\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -9976,7 +9976,7 @@ fill_valid:
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -9998,7 +9998,7 @@ int rtw89_fw_h2c_wow_cam_update_v1(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for wow payload cam update\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for wow payload cam update\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -10034,7 +10034,7 @@ done:
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 
+@@ -10065,7 +10065,7 @@ int rtw89_fw_h2c_wow_gtk_ofld(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for gtk ofld\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for gtk ofld\n");
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -10111,7 +10111,7 @@ hdr:
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		goto fail;
+ 	}
+ 	return 0;
+@@ -10131,7 +10131,7 @@ int rtw89_fw_h2c_fwips(struct rtw89_dev *rtwdev, struct rtw89_vif_link *rtwvif_l
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for fw ips\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for fw ips\n");
+ 		return -ENOMEM;
+ 	}
+ 	skb_put(skb, len);
+@@ -10158,7 +10158,7 @@ int rtw89_fw_h2c_wow_request_aoac(struct rtw89_dev *rtwdev)
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for aoac\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for aoac\n");
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -10195,7 +10195,7 @@ static int rtw89_h2c_tx_and_wait(struct rtw89_dev *rtwdev, struct sk_buff *skb,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		dev_kfree_skb_any(skb);
+ 		ret = -EBUSY;
+ 		goto out;
+@@ -10220,8 +10220,8 @@ int rtw89_fw_h2c_add_mcc(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, H2C_ADD_MCC_LEN);
+ 	if (!skb) {
+-		rtw89_err(rtwdev,
+-			  "failed to alloc skb for add mcc\n");
++		rtw89_err_ratelimited(rtwdev,
++				      "failed to alloc skb for add mcc\n");
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -10267,8 +10267,8 @@ int rtw89_fw_h2c_start_mcc(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, H2C_START_MCC_LEN);
+ 	if (!skb) {
+-		rtw89_err(rtwdev,
+-			  "failed to alloc skb for start mcc\n");
++		rtw89_err_ratelimited(rtwdev,
++				      "failed to alloc skb for start mcc\n");
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -10303,8 +10303,8 @@ int rtw89_fw_h2c_stop_mcc(struct rtw89_dev *rtwdev, u8 group, u8 macid,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, H2C_STOP_MCC_LEN);
+ 	if (!skb) {
+-		rtw89_err(rtwdev,
+-			  "failed to alloc skb for stop mcc\n");
++		rtw89_err_ratelimited(rtwdev,
++				      "failed to alloc skb for stop mcc\n");
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -10333,8 +10333,8 @@ int rtw89_fw_h2c_del_mcc_group(struct rtw89_dev *rtwdev, u8 group,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, H2C_DEL_MCC_GROUP_LEN);
+ 	if (!skb) {
+-		rtw89_err(rtwdev,
+-			  "failed to alloc skb for del mcc group\n");
++		rtw89_err_ratelimited(rtwdev,
++				      "failed to alloc skb for del mcc group\n");
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -10361,8 +10361,8 @@ int rtw89_fw_h2c_reset_mcc_group(struct rtw89_dev *rtwdev, u8 group)
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, H2C_RESET_MCC_GROUP_LEN);
+ 	if (!skb) {
+-		rtw89_err(rtwdev,
+-			  "failed to alloc skb for reset mcc group\n");
++		rtw89_err_ratelimited(rtwdev,
++				      "failed to alloc skb for reset mcc group\n");
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -10392,8 +10392,8 @@ int rtw89_fw_h2c_mcc_req_tsf(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, H2C_MCC_REQ_TSF_LEN);
+ 	if (!skb) {
+-		rtw89_err(rtwdev,
+-			  "failed to alloc skb for mcc req tsf\n");
++		rtw89_err_ratelimited(rtwdev,
++				      "failed to alloc skb for mcc req tsf\n");
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -10434,8 +10434,8 @@ int rtw89_fw_h2c_mcc_macid_bitmap(struct rtw89_dev *rtwdev, u8 group, u8 macid,
+ 	h2c_len = H2C_MCC_MACID_BITMAP_DSC_LEN + map_len;
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, h2c_len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev,
+-			  "failed to alloc skb for mcc macid bitmap\n");
++		rtw89_err_ratelimited(rtwdev,
++				      "failed to alloc skb for mcc macid bitmap\n");
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -10465,8 +10465,8 @@ int rtw89_fw_h2c_mcc_sync(struct rtw89_dev *rtwdev, u8 group, u8 source,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, H2C_MCC_SYNC_LEN);
+ 	if (!skb) {
+-		rtw89_err(rtwdev,
+-			  "failed to alloc skb for mcc sync\n");
++		rtw89_err_ratelimited(rtwdev,
++				      "failed to alloc skb for mcc sync\n");
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -10496,8 +10496,8 @@ int rtw89_fw_h2c_mcc_set_duration(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, H2C_MCC_SET_DURATION_LEN);
+ 	if (!skb) {
+-		rtw89_err(rtwdev,
+-			  "failed to alloc skb for mcc set duration\n");
++		rtw89_err_ratelimited(rtwdev,
++				      "failed to alloc skb for mcc set duration\n");
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -10601,7 +10601,7 @@ int rtw89_fw_h2c_mrc_add(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for mrc add\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for mrc add\n");
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -10630,7 +10630,7 @@ int rtw89_fw_h2c_mrc_add(struct rtw89_dev *rtwdev,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		dev_kfree_skb_any(skb);
+ 		return -EBUSY;
+ 	}
+@@ -10649,7 +10649,7 @@ int rtw89_fw_h2c_mrc_start(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for mrc start\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for mrc start\n");
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -10686,7 +10686,7 @@ int rtw89_fw_h2c_mrc_del(struct rtw89_dev *rtwdev, u8 sch_idx, u8 slot_idx)
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for mrc del\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for mrc del\n");
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -10721,7 +10721,7 @@ int rtw89_fw_h2c_mrc_req_tsf(struct rtw89_dev *rtwdev,
+ 	len = struct_size(h2c, infos, arg->num);
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for mrc req tsf\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for mrc req tsf\n");
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -10762,7 +10762,7 @@ int rtw89_fw_h2c_mrc_upd_bitmap(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for mrc upd bitmap\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for mrc upd bitmap\n");
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -10786,7 +10786,7 @@ int rtw89_fw_h2c_mrc_upd_bitmap(struct rtw89_dev *rtwdev,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		dev_kfree_skb_any(skb);
+ 		return -EBUSY;
+ 	}
+@@ -10804,7 +10804,7 @@ int rtw89_fw_h2c_mrc_sync(struct rtw89_dev *rtwdev,
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for mrc sync\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for mrc sync\n");
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -10830,7 +10830,7 @@ int rtw89_fw_h2c_mrc_sync(struct rtw89_dev *rtwdev,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		dev_kfree_skb_any(skb);
+ 		return -EBUSY;
+ 	}
+@@ -10850,7 +10850,7 @@ int rtw89_fw_h2c_mrc_upd_duration(struct rtw89_dev *rtwdev,
+ 	len = struct_size(h2c, slots, arg->slot_num);
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for mrc upd duration\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for mrc upd duration\n");
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -10883,7 +10883,7 @@ int rtw89_fw_h2c_mrc_upd_duration(struct rtw89_dev *rtwdev,
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		dev_kfree_skb_any(skb);
+ 		return -EBUSY;
+ 	}
+@@ -10900,7 +10900,7 @@ static int rtw89_fw_h2c_ap_info(struct rtw89_dev *rtwdev, bool en)
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for ap info\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for ap info\n");
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -10917,7 +10917,7 @@ static int rtw89_fw_h2c_ap_info(struct rtw89_dev *rtwdev, bool en)
+ 
+ 	ret = rtw89_h2c_tx(rtwdev, skb, false);
+ 	if (ret) {
+-		rtw89_err(rtwdev, "failed to send h2c\n");
++		rtw89_err_ratelimited(rtwdev, "failed to send h2c\n");
+ 		dev_kfree_skb_any(skb);
+ 		return -EBUSY;
+ 	}
+@@ -10969,7 +10969,7 @@ int rtw89_fw_h2c_mlo_link_cfg(struct rtw89_dev *rtwdev, struct rtw89_vif_link *r
+ 
+ 	skb = rtw89_fw_h2c_alloc_skb_with_hdr(rtwdev, len);
+ 	if (!skb) {
+-		rtw89_err(rtwdev, "failed to alloc skb for mlo link cfg\n");
++		rtw89_err_ratelimited(rtwdev, "failed to alloc skb for mlo link cfg\n");
+ 		return -ENOMEM;
+ 	}
+ 
