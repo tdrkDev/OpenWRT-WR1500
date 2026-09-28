@@ -1,0 +1,31 @@
+From: Roman Rikhter <teledurak@gmail.com>
+Subject: [PATCH] wifi: rtw89: pci: kick the TX queues on TX completion
+
+When a TX queue holds more frames than the DMA ring has room for,
+rtw89_core_txq_schedule() sends what fits and runs again from a delayed
+work one jiffy later. Nothing else restarts it: the TX queue work runs
+from wake_tx_queue, from that delayed work and at the end of a
+remain-on-channel. After a burst that filled the ring, the rest waits for
+the timer (up to 10 ms at HZ=100), even if the ring has long drained.
+
+Queue the TX queue work whenever the release report queue returned TX
+buffers, as other drivers do on TX completion (mt76 on TX free events,
+ath10k from its completion NAPI). The delayed work stays as a fallback.
+
+Signed-off-by: Roman Rikhter <teledurak@gmail.com>
+---
+diff --git drivers/net/wireless/realtek/rtw89/pci.c drivers/net/wireless/realtek/rtw89/pci.c
+index 4a26b5b..bdfdc69 100644
+--- a/drivers/net/wireless/realtek/rtw89/pci.c
++++ b/drivers/net/wireless/realtek/rtw89/pci.c
+@@ -847,6 +847,10 @@ static int rtw89_pci_poll_rpq_dma(struct rtw89_dev *rtwdev,
+ out_unlock:
+ 	spin_unlock_bh(&rtwpci->trx_lock);
+ 
++	/* frames left in the TX queues may wait for what was released */
++	if (cnt)
++		queue_work(rtwdev->txq_wq, &rtwdev->txq_work);
++
+ 	/* always release all RPQ */
+ 	work_done = min_t(int, cnt, budget);
+ 	rtwdev->napi_budget_countdown -= work_done;
