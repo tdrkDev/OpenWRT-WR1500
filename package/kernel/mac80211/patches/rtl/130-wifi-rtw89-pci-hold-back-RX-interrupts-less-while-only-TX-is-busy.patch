@@ -1,0 +1,125 @@
+From: Roman Rikhter <teledurak@gmail.com>
+Subject: [PATCH] wifi: rtw89: pci: hold back RX interrupts less while only
+ TX is busy
+
+Once TX or RX goes over about 50 Mbit/s, the interrupts of the RX ring
+and of the release report ring are held back for up to 2 ms, for both
+rings, with one timer. While only TX is busy, the RX ring gets little
+more than the TCP ACKs of the stations and the frames with which dozing
+stations say they are awake, and each of them waits up to 2 ms before
+mac80211 sees it: the ACK clock of a download slows down, a station
+that woke up waits longer for its frames, and the airtime and TX
+buffers of sent frames come back later.
+
+Let the PCI info of a chip give a shorter time for when RX isn't busy,
+and use 512 us on the RTL8832BR, a router chip whose clients mostly
+download; other WiFi 6 chips keep 2 ms. The rx_mit_us parameter
+overrides the time for all WiFi 6 chips, in steps of 64 us, and 0 turns
+the mitigation off while only TX is busy. A new value takes effect
+within two seconds.
+
+Signed-off-by: Roman Rikhter <teledurak@gmail.com>
+---
+diff --git drivers/net/wireless/realtek/rtw89/pci.c drivers/net/wireless/realtek/rtw89/pci.c
+index dfe7c6d..c851598 100644
+--- a/drivers/net/wireless/realtek/rtw89/pci.c
++++ b/drivers/net/wireless/realtek/rtw89/pci.c
+@@ -23,6 +23,11 @@ static bool rtw89_pci_disable_rx_tag_check;
+ module_param_named(disable_rx_tag_check, rtw89_pci_disable_rx_tag_check, bool, 0644);
+ MODULE_PARM_DESC(disable_rx_tag_check, "Set Y to use RX buffers without checking their tag");
+ 
++static int rtw89_pci_rx_mit_us = -1;
++module_param_named(rx_mit_us, rtw89_pci_rx_mit_us, int, 0644);
++MODULE_PARM_DESC(rx_mit_us,
++		 "RX interrupt mitigation time in us while only TX is busy (64 us steps, 0: off, -1: chip default)");
++
+ static int rtw89_pci_get_phy_offset_by_link_speed(struct rtw89_dev *rtwdev,
+ 						  u32 *phy_offset)
+ {
+@@ -4660,24 +4665,42 @@ static void rtw89_pci_aspm_set_ax(struct rtw89_dev *rtwdev, bool enable)
+ 
+ static void rtw89_pci_recalc_int_mit(struct rtw89_dev *rtwdev)
+ {
++	struct rtw89_pci *rtwpci = (struct rtw89_pci *)rtwdev->priv;
+ 	enum rtw89_chip_gen chip_gen = rtwdev->chip->chip_gen;
+ 	const struct rtw89_pci_info *info = rtwdev->pci_info;
+ 	struct rtw89_traffic_stats *stats = &rtwdev->stats;
+ 	enum rtw89_tfc_lv tx_tfc_lv = stats->tx_tfc_lv;
+ 	enum rtw89_tfc_lv rx_tfc_lv = stats->rx_tfc_lv;
++	int mit_us = READ_ONCE(rtw89_pci_rx_mit_us);
++	u32 timer = 2048;
+ 	u32 val = 0;
+ 
++	rtwpci->rx_mit_us = mit_us;
++
+ 	if (rtwdev->scanning ||
+ 	    (tx_tfc_lv < RTW89_TFC_HIGH && rx_tfc_lv < RTW89_TFC_HIGH))
+ 		goto out;
+ 
++	/*
++	 * One timer holds back the interrupts of the RX ring and of the
++	 * release report ring. While only TX is busy, the RX ring gets little
++	 * more than TCP ACKs and the frames with which dozing stations wake
++	 * up: holding them back delays the frames sent in return.
++	 */
++	if (rx_tfc_lv < RTW89_TFC_HIGH) {
++		if (mit_us >= 0)
++			timer = mit_us;
++		else if (info->rx_mit_tx_only_us)
++			timer = info->rx_mit_tx_only_us;
++	}
++
+ 	if (chip_gen == RTW89_CHIP_BE)
+ 		val = B_BE_PCIE_MIT_RX0P2_EN | B_BE_PCIE_MIT_RX0P1_EN;
+-	else
++	else if (timer)
+ 		val = B_AX_RXMIT_RXP2_SEL | B_AX_RXMIT_RXP1_SEL |
+ 		      FIELD_PREP(B_AX_RXCOUNTER_MATCH_MASK, RTW89_PCI_RXBD_NUM_MAX / 2) |
+ 		      FIELD_PREP(B_AX_RXTIMER_UNIT_MASK, AX_RXTIMER_UNIT_64US) |
+-		      FIELD_PREP(B_AX_RXTIMER_MATCH_MASK, 2048 / 64);
++		      FIELD_PREP(B_AX_RXTIMER_MATCH_MASK, clamp_t(u32, timer / 64, 1, 255));
+ 
+ out:
+ 	rtw89_write32(rtwdev, info->mit_addr, val);
+@@ -4804,6 +4827,9 @@ static void rtw89_pci_ops_track(struct rtw89_dev *rtwdev)
+ 	if (rtwpci->low_power || rtwpci->under_recovery || rtwdev->hci.paused)
+ 		return;
+ 
++	if (rtwpci->rx_mit_us != READ_ONCE(rtw89_pci_rx_mit_us))
++		rtw89_pci_recalc_int_mit(rtwdev);
++
+ 	for (txch = 0; txch < RTW89_TXCH_NUM; txch++) {
+ 		struct rtw89_pci_tx_ring *tx_ring = &rtwpci->tx.rings[txch];
+ 
+diff --git drivers/net/wireless/realtek/rtw89/pci.h drivers/net/wireless/realtek/rtw89/pci.h
+index d29be04..ba0409f 100644
+--- a/drivers/net/wireless/realtek/rtw89/pci.h
++++ b/drivers/net/wireless/realtek/rtw89/pci.h
+@@ -1415,6 +1415,7 @@ struct rtw89_pci_info {
+ 	bool min_intr_mask;
+ 	bool wp_seq_gen;
+ 	u32 rpp_fmt_size;
++	u32 rx_mit_tx_only_us;
+ 
+ 	u32 init_cfg_reg;
+ 	u32 txhci_en_bit;
+@@ -1686,6 +1687,7 @@ struct rtw89_pci {
+ 	u32 ind_intrs;
+ 	u32 halt_c2h_intrs;
+ 	u32 intrs[2];
++	int rx_mit_us;
+ 	u32 stats_tracks;
+ 	u64 stats_sum;
+ 	void __iomem *mmap;
+diff --git drivers/net/wireless/realtek/rtw89/rtw8852ce.c drivers/net/wireless/realtek/rtw89/rtw8852ce.c
+index 41ebc30..4b7ca4f 100644
+--- a/drivers/net/wireless/realtek/rtw89/rtw8852ce.c
++++ b/drivers/net/wireless/realtek/rtw89/rtw8852ce.c
+@@ -101,6 +101,7 @@ static const struct rtw89_pci_info rtw8832br_pci_info = {
+ 	.min_intr_mask		= true,
+ 	.wp_seq_gen		= true,
+ 	.rpp_fmt_size		= sizeof(struct rtw89_pci_rpp_fmt),
++	.rx_mit_tx_only_us	= 512,
+ 
+ 	.init_cfg_reg		= R_AX_HAXI_INIT_CFG1,
+ 	.txhci_en_bit		= B_AX_TXHCI_EN_V1,
