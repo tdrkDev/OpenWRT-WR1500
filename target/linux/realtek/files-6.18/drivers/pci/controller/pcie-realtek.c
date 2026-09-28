@@ -14,7 +14,9 @@
 #include <linux/pci.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
+#include <linux/ratelimit.h>
 #include <linux/regmap.h>
+#include <linux/workqueue.h>
 
 #include "../pci.h"
 
@@ -27,18 +29,29 @@
 #define RTPCIE_HOSTCFG_ENABLE	0x80c
 #define RTPCIE_ENABLE_BIT17	BIT(17)
 #define RTPCIE_LINK_STATUS	0x728
-#define RTPCIE_LINKUP_MASK	GENMASK(4, 0)
-#define RTPCIE_IS_LINKUP	(BIT(4) | BIT(0))
+#define RTPCIE_LTSSM		GENMASK(4, 0)
+#define RTPCIE_LTSSM_L0		0x11
+#define RTPCIE_LTSSM_L1_IDLE	0x14
 #define RTPCIE_PCI_CMD_BIT20	BIT(20)
+
+#define RTPCIE_DEVSTA_ERR	(PCI_EXP_DEVSTA_CED | PCI_EXP_DEVSTA_NFED | \
+				 PCI_EXP_DEVSTA_FED | PCI_EXP_DEVSTA_URD)
+#define RTPCIE_LINK_DOWN_CHECKS	3
+
+static bool panic_on_link_down = true;
+module_param(panic_on_link_down, bool, 0644);
+MODULE_PARM_DESC(panic_on_link_down, "Panic when the link stays down (default: true)");
 
 /**
  * struct rtpcie_soc_data - SoC specific details
  * @sysctl_perst: PERST# is driven by the system controller, not a GPIO
  * @speed_change: start a speed change after the link is up
+ * @link_check: check the link and the error status once a second
  */
 struct rtpcie_soc_data {
 	bool sysctl_perst;
 	bool speed_change;
+	bool link_check;
 };
 
 /**
@@ -52,6 +65,9 @@ struct rtpcie_soc_data {
  * @sysctl: system controller, for PERST# when @soc->sysctl_perst is set
  * @phy: pointer to PHY control block
  * @bus_number: assigned PCI bus number
+ * @bus: root bus
+ * @link_work: link check
+ * @link_down: number of consecutive checks that found the link down
  */
 struct rtpcie_ctrl {
 	struct device *dev;
@@ -63,6 +79,9 @@ struct rtpcie_ctrl {
 	struct regmap *sysctl;
 	struct phy *phy;
 	u8 bus_number;
+	struct pci_bus *bus;
+	struct delayed_work link_work;
+	unsigned int link_down;
 };
 
 static void __iomem *rtpcie_map_bus(struct pci_bus *bus, unsigned int devfn, int where)
@@ -127,7 +146,7 @@ static int rtpcie_hw_init(struct rtpcie_ctrl *pcie)
 
 	/* Wait for Link Up */
 	err = readl_poll_timeout(pcie->hostcfg_base + RTPCIE_LINK_STATUS, val,
-				 (val & RTPCIE_LINKUP_MASK) == RTPCIE_IS_LINKUP,
+				 FIELD_GET(RTPCIE_LTSSM, val) == RTPCIE_LTSSM_L0,
 				 10000, 100000);
 
 	if (err) {
@@ -162,6 +181,58 @@ static int rtpcie_hw_init(struct rtpcie_ctrl *pcie)
 	return err;
 }
 
+/* The error bits of the root port are write-one-to-clear */
+static u16 rtpcie_clear_errors(struct rtpcie_ctrl *pcie)
+{
+	u16 devsta;
+
+	pci_bus_read_config_word(pcie->bus, 0,
+				 RTPCIE_HOSTCFG_CAP + PCI_EXP_DEVSTA, &devsta);
+	devsta &= RTPCIE_DEVSTA_ERR;
+	if (devsta)
+		pci_bus_write_config_word(pcie->bus, 0,
+					  RTPCIE_HOSTCFG_CAP + PCI_EXP_DEVSTA,
+					  devsta);
+
+	return devsta;
+}
+
+/*
+ * Any access to the device after the link went down stalls the SoC bus for
+ * good. Nothing can catch that access, but a link that goes down while the
+ * device is idle can end in a panic that logs why the system restarts.
+ */
+static void rtpcie_link_check(struct work_struct *work)
+{
+	struct rtpcie_ctrl *pcie = container_of(to_delayed_work(work),
+						struct rtpcie_ctrl, link_work);
+	static DEFINE_RATELIMIT_STATE(err_rs, 60 * HZ, 1);
+	u32 ltssm;
+	u16 devsta;
+
+	/* Config reads of absent functions end in unsupported requests */
+	devsta = rtpcie_clear_errors(pcie) & ~PCI_EXP_DEVSTA_URD;
+	if (devsta && __ratelimit(&err_rs))
+		dev_warn(pcie->dev, "error status %#x\n", devsta);
+
+	pci_bus_read_config_dword(pcie->bus, 0, RTPCIE_LINK_STATUS, &ltssm);
+	ltssm = FIELD_GET(RTPCIE_LTSSM, ltssm);
+
+	/* Between L0 and L1 the link is up */
+	if (ltssm >= RTPCIE_LTSSM_L0 && ltssm <= RTPCIE_LTSSM_L1_IDLE) {
+		if (pcie->link_down >= RTPCIE_LINK_DOWN_CHECKS)
+			dev_info(pcie->dev, "link up\n");
+		pcie->link_down = 0;
+	} else if (++pcie->link_down == RTPCIE_LINK_DOWN_CHECKS) {
+		if (panic_on_link_down)
+			panic("%s: link down, LTSSM %#x\n",
+			      dev_name(pcie->dev), ltssm);
+		dev_err(pcie->dev, "link down, LTSSM %#x\n", ltssm);
+	}
+
+	schedule_delayed_work(&pcie->link_work, round_jiffies_relative(HZ));
+}
+
 static int rtpcie_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -177,6 +248,7 @@ static int rtpcie_probe(struct platform_device *pdev)
 	pcie->dev = dev;
 	pcie->soc = of_device_get_match_data(dev);
 	pcie->bus_number = 0xff;
+	INIT_DELAYED_WORK(&pcie->link_work, rtpcie_link_check);
 	platform_set_drvdata(pdev, pcie);
 
 	pcie->hostcfg_base = devm_platform_ioremap_resource_byname(pdev, "hostcfg");
@@ -224,11 +296,27 @@ static int rtpcie_probe(struct platform_device *pdev)
 		return ret;
 	}
 
+	pcie->bus = bridge->bus;
+
+	if (pcie->soc->link_check) {
+		/* Start with the errors of link training and enumeration cleared */
+		rtpcie_clear_errors(pcie);
+		schedule_delayed_work(&pcie->link_work, HZ);
+	}
+
 	return 0;
+}
+
+static void rtpcie_shutdown(struct platform_device *pdev)
+{
+	struct rtpcie_ctrl *pcie = platform_get_drvdata(pdev);
+
+	cancel_delayed_work_sync(&pcie->link_work);
 }
 
 static const struct rtpcie_soc_data rtl8197f_pcie_data = {
 	.sysctl_perst = true,
+	.link_check = true,
 };
 
 static const struct rtpcie_soc_data rtl9607c_pcie_data = {
@@ -244,9 +332,11 @@ MODULE_DEVICE_TABLE(of, rtpcie_of_match);
 
 static struct platform_driver rtpcie_driver = {
 	.probe = rtpcie_probe,
+	.shutdown = rtpcie_shutdown,
 	.driver = {
 		.name = "realtek-pcie",
 		.of_match_table = rtpcie_of_match,
+		.suppress_bind_attrs = true,
 	},
 };
 builtin_platform_driver(rtpcie_driver);
