@@ -1,0 +1,306 @@
+From: Roman Rikhter <teledurak@gmail.com>
+Subject: [PATCH] wifi: rtw89: pci: warn about stalled TX
+
+A frame keeps its WD page, and with AQL its airtime, until its release
+report arrives. When a report is lost, nothing gives them back short of
+a reset of the device. When the TX DMA of a channel stops, frames pile
+up in the TX queues. Either way TX to the stations slows down and stops
+without any message, and the memory held by the TX queues isn't freed.
+
+Check for both every two seconds in the track work. Keep the pages that
+the DMA fetched and that wait for their release report in a list, in the
+order of fetch: only the oldest pages then need a look, at the cost of
+two list operations per frame. Pages are only known to be fetched when
+TX reclaims them, which it doesn't do on a ring that went idle, so
+reclaim them here too. Warn when pages have waited for more than 10
+seconds, again at most once a minute while their number grows, and when
+a channel that has buffers to fetch hasn't moved for three runs. Only
+warn: what to do about it is left for later.
+
+Also say every ten minutes, when they changed, how many RX tags came
+late or not at all, and how many release reports were stale.
+
+Signed-off-by: Roman Rikhter <teledurak@gmail.com>
+---
+diff --git drivers/net/wireless/realtek/rtw89/core.c drivers/net/wireless/realtek/rtw89/core.c
+index 127c0d8..77e9a47 100644
+--- a/drivers/net/wireless/realtek/rtw89/core.c
++++ b/drivers/net/wireless/realtek/rtw89/core.c
+@@ -5439,6 +5439,7 @@ static void rtw89_track_work(struct wiphy *wiphy, struct wiphy_work *work)
+ 		rtw89_hci_recalc_int_mit(rtwdev);
+ 		rtw89_btc_ntfy_wl_sta(rtwdev);
+ 	}
++	rtw89_hci_track(rtwdev);
+ 	rtw89_mac_bf_monitor_track(rtwdev);
+ 	rtw89_core_bcn_track(rtwdev);
+ 	rtw89_phy_stat_track(rtwdev);
+diff --git drivers/net/wireless/realtek/rtw89/core.h drivers/net/wireless/realtek/rtw89/core.h
+index d0bc3c8..7c714c9 100644
+--- a/drivers/net/wireless/realtek/rtw89/core.h
++++ b/drivers/net/wireless/realtek/rtw89/core.h
+@@ -3798,6 +3798,7 @@ struct rtw89_hci_ops {
+ 	void (*pause)(struct rtw89_dev *rtwdev, bool pause);
+ 	void (*switch_mode)(struct rtw89_dev *rtwdev, bool low_power);
+ 	void (*recalc_int_mit)(struct rtw89_dev *rtwdev);
++	void (*track)(struct rtw89_dev *rtwdev);
+ 
+ 	u8 (*read8)(struct rtw89_dev *rtwdev, u32 addr);
+ 	u16 (*read16)(struct rtw89_dev *rtwdev, u32 addr);
+@@ -6867,6 +6868,12 @@ static inline void rtw89_hci_recalc_int_mit(struct rtw89_dev *rtwdev)
+ 	rtwdev->hci.ops->recalc_int_mit(rtwdev);
+ }
+ 
++static inline void rtw89_hci_track(struct rtw89_dev *rtwdev)
++{
++	if (rtwdev->hci.ops->track)
++		rtwdev->hci.ops->track(rtwdev);
++}
++
+ static inline u32 rtw89_hci_check_and_reclaim_tx_resource(struct rtw89_dev *rtwdev, u8 txch)
+ {
+ 	return rtwdev->hci.ops->check_and_reclaim_tx_resource(rtwdev, txch);
+diff --git drivers/net/wireless/realtek/rtw89/pci.c drivers/net/wireless/realtek/rtw89/pci.c
+index a31b91d..dfe7c6d 100644
+--- a/drivers/net/wireless/realtek/rtw89/pci.c
++++ b/drivers/net/wireless/realtek/rtw89/pci.c
+@@ -672,8 +672,13 @@ static void rtw89_pci_reclaim_txbd(struct rtw89_dev *rtwdev, struct rtw89_pci_tx
+ 		list_del_init(&txwd->list);
+ 
+ 		/* this skb has been freed by RPP */
+-		if (skb_queue_len(&txwd->queue) == 0)
++		if (skb_queue_len(&txwd->queue) == 0) {
+ 			rtw89_pci_enqueue_txwd(tx_ring, txwd);
++			continue;
++		}
++
++		txwd->fetch_time = jiffies;
++		list_add_tail(&txwd->rpp_list, &tx_ring->rpp_pages);
+ 	}
+ }
+ 
+@@ -731,6 +736,8 @@ static void rtw89_pci_release_txwd_skb(struct rtw89_dev *rtwdev,
+ 					       txch, seq);
+ 	}
+ 
++	list_del_init(&txwd->rpp_list);
++
+ 	skb_queue_walk_safe(&txwd->queue, skb, tmp) {
+ 		skb_unlink(skb, &txwd->queue);
+ 
+@@ -3945,6 +3952,7 @@ static int rtw89_pci_alloc_tx_wd_ring(struct rtw89_dev *rtwdev,
+ 
+ 		skb_queue_head_init(&txwd->queue);
+ 		INIT_LIST_HEAD(&txwd->list);
++		INIT_LIST_HEAD(&txwd->rpp_list);
+ 		txwd->paddr = cur_paddr;
+ 		txwd->vaddr = cur_vaddr;
+ 		txwd->len = page_size;
+@@ -3980,6 +3988,7 @@ static int rtw89_pci_alloc_tx_ring(struct rtw89_dev *rtwdev,
+ 	}
+ 
+ 	INIT_LIST_HEAD(&tx_ring->busy_pages);
++	INIT_LIST_HEAD(&tx_ring->rpp_pages);
+ 	tx_ring->bd_ring.head = head;
+ 	tx_ring->bd_ring.dma = dma;
+ 	tx_ring->bd_ring.len = len;
+@@ -4674,6 +4683,143 @@ out:
+ 	rtw89_write32(rtwdev, info->mit_addr, val);
+ }
+ 
++#define RTW89_PCI_TX_RPP_TIMEOUT	(10 * HZ)
++#define RTW89_PCI_TX_RPP_WARN_INTVL	(60 * HZ)
++#define RTW89_PCI_TX_STALL_TRACKS	3
++#define RTW89_PCI_STATS_TRACKS		300
++
++/*
++ * A page that got no release report keeps its frame, and with AQL the
++ * airtime of the frame, until the device is reset. Pages wait in the
++ * order they were fetched, so only the oldest ones need a look.
++ */
++static bool rtw89_pci_track_tx_rpp(struct rtw89_dev *rtwdev,
++				   struct rtw89_pci_tx_ring *tx_ring)
++{
++	struct rtw89_pci *rtwpci = (struct rtw89_pci *)rtwdev->priv;
++	struct rtw89_pci_tx_wd *txwd;
++	u32 lost = 0;
++
++	spin_lock_bh(&rtwpci->trx_lock);
++
++	/* only TX reclaims the pages of the last frames of a burst */
++	if (!list_empty(&tx_ring->busy_pages))
++		rtw89_pci_reclaim_txbd(rtwdev, tx_ring);
++
++	list_for_each_entry(txwd, &tx_ring->rpp_pages, rpp_list) {
++		if (time_before(jiffies, txwd->fetch_time + RTW89_PCI_TX_RPP_TIMEOUT))
++			break;
++		lost++;
++	}
++	spin_unlock_bh(&rtwpci->trx_lock);
++
++	if (!lost) {
++		tx_ring->rpp_lost = 0;
++		return false;
++	}
++
++	/* warn when it starts, then at most once a minute while it grows */
++	if (lost <= tx_ring->rpp_lost ||
++	    (tx_ring->rpp_lost &&
++	     time_before(jiffies, tx_ring->rpp_warn_time + RTW89_PCI_TX_RPP_WARN_INTVL)))
++		return false;
++
++	tx_ring->rpp_lost = lost;
++	tx_ring->rpp_warn_time = jiffies;
++
++	rtw89_warn(rtwdev, "queue %d: %u frames without release report for %d s\n",
++		   tx_ring->txch, lost, RTW89_PCI_TX_RPP_TIMEOUT / HZ);
++
++	return true;
++}
++
++/* a DMA channel that has buffers to fetch but doesn't move is stuck */
++static bool rtw89_pci_track_tx_dma(struct rtw89_dev *rtwdev,
++				   struct rtw89_pci_tx_ring *tx_ring)
++{
++	struct rtw89_pci *rtwpci = (struct rtw89_pci *)rtwdev->priv;
++	struct rtw89_pci_dma_ring *bd_ring = &tx_ring->bd_ring;
++	u32 hw_idx, host_idx;
++
++	spin_lock_bh(&rtwpci->trx_lock);
++	host_idx = bd_ring->wp;
++	if (bd_ring->rp != host_idx)
++		hw_idx = FIELD_GET(TXBD_HW_IDX_MASK,
++				   rtw89_read32(rtwdev, bd_ring->addr.idx));
++	else
++		hw_idx = host_idx;
++	spin_unlock_bh(&rtwpci->trx_lock);
++
++	if (hw_idx == host_idx || hw_idx != tx_ring->stall_idx) {
++		tx_ring->stall_idx = hw_idx;
++		tx_ring->stall_cnt = 0;
++		return false;
++	}
++
++	if (++tx_ring->stall_cnt != RTW89_PCI_TX_STALL_TRACKS)
++		return false;
++
++	rtw89_warn(rtwdev, "queue %d: TX DMA stalled at %u, host index %u\n",
++		   tx_ring->txch, hw_idx, host_idx);
++
++	return true;
++}
++
++/* say every ten minutes how often RX tags were late and reports stale */
++static void rtw89_pci_track_stats(struct rtw89_dev *rtwdev)
++{
++	struct rtw89_pci *rtwpci = (struct rtw89_pci *)rtwdev->priv;
++	struct rtw89_pci_rx_ring *rxq = &rtwpci->rx.rings[RTW89_RXCH_RXQ];
++	struct rtw89_pci_rx_ring *rpq = &rtwpci->rx.rings[RTW89_RXCH_RPQ];
++	u64 stale = 0, sum;
++	int txch;
++
++	if (++rtwpci->stats_tracks < RTW89_PCI_STATS_TRACKS)
++		return;
++	rtwpci->stats_tracks = 0;
++
++	for (txch = 0; txch < RTW89_TXCH_NUM; txch++)
++		stale += rtwpci->tx.rings[txch].tx_stale_rpp;
++
++	/* the counters only grow: a new sum is news */
++	sum = stale + rxq->rx_tag_late + rxq->rx_tag_dropped +
++	      rpq->rx_tag_late + rpq->rx_tag_dropped;
++	if (sum == rtwpci->stats_sum)
++		return;
++	rtwpci->stats_sum = sum;
++
++	rtw89_info(rtwdev,
++		   "RX tags late/dropped: RXQ %u/%u, RPQ %u/%u; stale release reports: %llu\n",
++		   rxq->rx_tag_late, rxq->rx_tag_dropped,
++		   rpq->rx_tag_late, rpq->rx_tag_dropped, stale);
++}
++
++static void rtw89_pci_ops_track(struct rtw89_dev *rtwdev)
++{
++	struct rtw89_pci *rtwpci = (struct rtw89_pci *)rtwdev->priv;
++	const struct rtw89_pci_info *info = rtwdev->pci_info;
++	bool rpp_reported = false, dma_reported = false;
++	int txch;
++
++	if (rtwpci->low_power || rtwpci->under_recovery || rtwdev->hci.paused)
++		return;
++
++	for (txch = 0; txch < RTW89_TXCH_NUM; txch++) {
++		struct rtw89_pci_tx_ring *tx_ring = &rtwpci->tx.rings[txch];
++
++		if (txch == RTW89_TXCH_CH12 || info->tx_dma_ch_mask & BIT(txch))
++			continue;
++
++		/* one message of each kind per run, the rest waits */
++		if (!rpp_reported)
++			rpp_reported = rtw89_pci_track_tx_rpp(rtwdev, tx_ring);
++		if (!dma_reported)
++			dma_reported = rtw89_pci_track_tx_dma(rtwdev, tx_ring);
++	}
++
++	rtw89_pci_track_stats(rtwdev);
++}
++
+ static void rtw89_pci_link_cfg(struct rtw89_dev *rtwdev)
+ {
+ 	struct rtw89_pci *rtwpci = (struct rtw89_pci *)rtwdev->priv;
+@@ -5128,6 +5274,7 @@ static const struct rtw89_hci_ops rtw89_pci_ops = {
+ 	.pause		= rtw89_pci_ops_pause,
+ 	.switch_mode	= rtw89_pci_ops_switch_mode,
+ 	.recalc_int_mit = rtw89_pci_recalc_int_mit,
++	.track		= rtw89_pci_ops_track,
+ 
+ 	.read8		= rtw89_pci_ops_read8,
+ 	.read16		= rtw89_pci_ops_read16,
+diff --git drivers/net/wireless/realtek/rtw89/pci.h drivers/net/wireless/realtek/rtw89/pci.h
+index be72264..d29be04 100644
+--- a/drivers/net/wireless/realtek/rtw89/pci.h
++++ b/drivers/net/wireless/realtek/rtw89/pci.h
+@@ -1567,6 +1567,8 @@ struct rtw89_pci_rxbd_info {
+ 
+ struct rtw89_pci_tx_wd {
+ 	struct list_head list;
++	/* on rpp_pages while fetched but not released */
++	struct list_head rpp_list;
+ 	struct sk_buff_head queue;
+ 
+ 	void *vaddr;
+@@ -1574,6 +1576,7 @@ struct rtw89_pci_tx_wd {
+ 	u32 len;
+ 	u32 seq;
+ 	u8 gen;
++	unsigned long fetch_time;
+ };
+ 
+ struct rtw89_pci_dma_ring {
+@@ -1612,10 +1615,18 @@ struct rtw89_pci_tx_ring {
+ 	struct rtw89_pci_tx_wd_ring wd_ring;
+ 	struct rtw89_pci_dma_ring bd_ring;
+ 	struct list_head busy_pages;
++	/* pages waiting for their release report, in the order of fetch */
++	struct list_head rpp_pages;
+ 	u8 txch;
+ 	bool dma_enabled;
+ 	u16 tag; /* range from 0x0001 ~ 0x1fff */
+ 
++	/* TX stall tracking */
++	u32 rpp_lost;
++	unsigned long rpp_warn_time;
++	u32 stall_idx;
++	u8 stall_cnt;
++
+ 	u64 tx_cnt;
+ 	u64 tx_acked;
+ 	u64 tx_retry_lmt;
+@@ -1675,6 +1686,8 @@ struct rtw89_pci {
+ 	u32 ind_intrs;
+ 	u32 halt_c2h_intrs;
+ 	u32 intrs[2];
++	u32 stats_tracks;
++	u64 stats_sum;
+ 	void __iomem *mmap;
+ };
+ 
