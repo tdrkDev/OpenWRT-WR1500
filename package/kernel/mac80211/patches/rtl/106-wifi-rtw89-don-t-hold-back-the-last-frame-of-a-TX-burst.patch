@@ -1,0 +1,106 @@
+From: Roman Rikhter <teledurak@gmail.com>
+Subject: [PATCH] wifi: rtw89: don't hold back the last frame of a TX burst
+
+While the device sends more than 50 Mbit/s, rtw89_core_txq_schedule()
+sends all but the last frame of a TX queue and keeps that frame back so
+that it can go out with the next ones. It is sent when more frames come,
+or after max_agg_wait runs of the TX queue work, each started one jiffy
+after the previous. max_agg_wait is 4 at PHY rates from 700 Mbit/s, so
+at HZ=100 the last frame of a burst waits up to 40 ms. That frame can be
+the end of a video frame, a TCP ACK or a ping, for any station, as long
+as the traffic of the whole device stays high.
+
+The hardware aggregates what is queued when it gets the medium, and
+frames that arrive meanwhile go into the next aggregate, so the hold
+gains little. Remove it.
+
+Signed-off-by: Roman Rikhter <teledurak@gmail.com>
+---
+diff --git drivers/net/wireless/realtek/rtw89/core.c drivers/net/wireless/realtek/rtw89/core.c
+index 813bd9f..94fbcdf 100644
+--- a/drivers/net/wireless/realtek/rtw89/core.c
++++ b/drivers/net/wireless/realtek/rtw89/core.c
+@@ -4777,48 +4777,6 @@ static u32 rtw89_check_and_reclaim_tx_resource(struct rtw89_dev *rtwdev, u8 tid)
+ 	return rtw89_hci_check_and_reclaim_tx_resource(rtwdev, ch_dma);
+ }
+ 
+-static bool rtw89_core_txq_agg_wait(struct rtw89_dev *rtwdev,
+-				    struct ieee80211_txq *txq,
+-				    unsigned long *frame_cnt,
+-				    bool *sched_txq, bool *reinvoke)
+-{
+-	struct rtw89_txq *rtwtxq = (struct rtw89_txq *)txq->drv_priv;
+-	struct rtw89_sta *rtwsta = sta_to_rtwsta_safe(txq->sta);
+-	struct rtw89_sta_link *rtwsta_link;
+-
+-	if (!rtwsta)
+-		return false;
+-
+-	rtwsta_link = rtw89_get_designated_link(rtwsta);
+-	if (unlikely(!rtwsta_link)) {
+-		rtw89_err(rtwdev, "agg wait: find no designated link\n");
+-		return false;
+-	}
+-
+-	if (rtwsta_link->max_agg_wait <= 0)
+-		return false;
+-
+-	if (rtwdev->stats.tx_tfc_lv <= RTW89_TFC_MID)
+-		return false;
+-
+-	if (*frame_cnt > 1) {
+-		*frame_cnt -= 1;
+-		*sched_txq = true;
+-		*reinvoke = true;
+-		rtwtxq->wait_cnt = 1;
+-		return false;
+-	}
+-
+-	if (*frame_cnt == 1 && rtwtxq->wait_cnt < rtwsta_link->max_agg_wait) {
+-		*reinvoke = true;
+-		rtwtxq->wait_cnt++;
+-		return true;
+-	}
+-
+-	rtwtxq->wait_cnt = 0;
+-	return false;
+-}
+-
+ static void rtw89_core_txq_schedule(struct rtw89_dev *rtwdev, u8 ac, bool *reinvoke)
+ {
+ 	struct ieee80211_hw *hw = rtwdev->hw;
+@@ -4828,7 +4786,6 @@ static void rtw89_core_txq_schedule(struct rtw89_dev *rtwdev, u8 ac, bool *reinv
+ 	unsigned long frame_cnt;
+ 	unsigned long byte_cnt;
+ 	u32 tx_resource;
+-	bool sched_txq;
+ 
+ 	ieee80211_txq_schedule_start(hw, ac);
+ 	while ((txq = ieee80211_next_txq(hw, ac))) {
+@@ -4840,16 +4797,11 @@ static void rtw89_core_txq_schedule(struct rtw89_dev *rtwdev, u8 ac, bool *reinv
+ 			continue;
+ 		}
+ 		tx_resource = rtw89_check_and_reclaim_tx_resource(rtwdev, txq->tid);
+-		sched_txq = false;
+ 
+ 		ieee80211_txq_get_depth(txq, &frame_cnt, &byte_cnt);
+-		if (rtw89_core_txq_agg_wait(rtwdev, txq, &frame_cnt, &sched_txq, reinvoke)) {
+-			ieee80211_return_txq(hw, txq, true);
+-			continue;
+-		}
+ 		frame_cnt = min_t(unsigned long, frame_cnt, tx_resource);
+ 		rtw89_core_txq_push(rtwdev, rtwtxq, frame_cnt, byte_cnt);
+-		ieee80211_return_txq(hw, txq, sched_txq);
++		ieee80211_return_txq(hw, txq, false);
+ 		if (frame_cnt != 0)
+ 			rtw89_core_tx_kick_off(rtwdev, rtw89_core_get_qsel(rtwdev, txq->tid));
+ 
+@@ -4880,7 +4832,7 @@ static void rtw89_core_txq_work(struct work_struct *w)
+ 		rtw89_core_txq_schedule(rtwdev, ac, &reinvoke);
+ 
+ 	if (reinvoke) {
+-		/* reinvoke to process the last frame */
++		/* reinvoke to process the frames left over */
+ 		mod_delayed_work(rtwdev->txq_wq, &rtwdev->txq_reinvoke_work, 1);
+ 	}
+ }
