@@ -1,0 +1,107 @@
+From: Roman Rikhter <teledurak@gmail.com>
+Subject: [PATCH] wifi: rtw89: implement flush_sta
+
+rtw89 has set_key but no flush_sta, so when a station leaves the
+authorized state (disconnect, roaming, deauthentication by the AP),
+mac80211 calls ieee80211_flush_queues(). That stops all queues of the
+radio, and rtw89_ops_flush() waits until the whole TX buffer of the chip
+is empty, for up to 200 ms, polling every 2.5-10 ms. No station gets a
+frame meanwhile. The wait often runs into the timeout: frames to the
+station that left are retried up to the retry limit, and while a client
+is in power save, group addressed frames stay in the chip until the next
+DTIM beacon. On an AP with a few clients this shows as two or three
+"timed out to flush queues" messages per disconnect, each 200 ms without
+TX.
+
+Implement flush_sta as ath10k and ath11k do: drop the frames of the
+station in the firmware, with the packet drop H2C for each AC of each
+link, after the DMA has fetched what the host queued. With firmware that
+can't drop packets, flush all queues as before.
+
+Also poll every 250 us instead of up to 10 ms in rtw89_mac_flush_txq(),
+so that other flushes end soon after the queues are empty.
+
+Signed-off-by: Roman Rikhter <teledurak@gmail.com>
+---
+diff --git drivers/net/wireless/realtek/rtw89/mac.c drivers/net/wireless/realtek/rtw89/mac.c
+index 8c39551..a9afc28 100644
+--- a/drivers/net/wireless/realtek/rtw89/mac.c
++++ b/drivers/net/wireless/realtek/rtw89/mac.c
+@@ -6357,7 +6357,7 @@ void rtw89_mac_flush_txq(struct rtw89_dev *rtwdev, u32 queues, bool drop)
+ 		return;
+ 
+ 	ret = read_poll_timeout(dle_is_txq_empty, empty, empty,
+-				10000, 200000, false, rtwdev);
++				250, 200000, false, rtwdev);
+ 	if (ret && !drop && (rtwdev->total_sta_assoc || rtwdev->scanning))
+ 		rtw89_info(rtwdev, "timed out to flush queues\n");
+ }
+@@ -7231,7 +7231,6 @@ int rtw89_mac_read_xtal_si_ax(struct rtw89_dev *rtwdev, u8 offset, u8 *val)
+ 	return 0;
+ }
+ 
+-static
+ void rtw89_mac_pkt_drop_sta(struct rtw89_dev *rtwdev,
+ 			    struct rtw89_vif_link *rtwvif_link,
+ 			    struct rtw89_sta_link *rtwsta_link)
+diff --git drivers/net/wireless/realtek/rtw89/mac.h drivers/net/wireless/realtek/rtw89/mac.h
+index 539061f..e6b0834 100644
+--- a/drivers/net/wireless/realtek/rtw89/mac.h
++++ b/drivers/net/wireless/realtek/rtw89/mac.h
+@@ -1713,6 +1713,9 @@ int rtw89_mac_read_xtal_si(struct rtw89_dev *rtwdev, u8 offset, u8 *val)
+ 	return mac->read_xtal_si(rtwdev, offset, val);
+ }
+ 
++void rtw89_mac_pkt_drop_sta(struct rtw89_dev *rtwdev,
++			    struct rtw89_vif_link *rtwvif_link,
++			    struct rtw89_sta_link *rtwsta_link);
+ void rtw89_mac_pkt_drop_vif(struct rtw89_dev *rtwdev, struct rtw89_vif *rtwvif);
+ int rtw89_mac_resize_ple_rx_quota(struct rtw89_dev *rtwdev, bool wow);
+ int rtw89_mac_ptk_drop_by_band_and_wait(struct rtw89_dev *rtwdev,
+diff --git drivers/net/wireless/realtek/rtw89/mac80211.c drivers/net/wireless/realtek/rtw89/mac80211.c
+index aade5c5..c9a0bbb 100644
+--- a/drivers/net/wireless/realtek/rtw89/mac80211.c
++++ b/drivers/net/wireless/realtek/rtw89/mac80211.c
+@@ -1110,6 +1110,34 @@ static void rtw89_ops_flush(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 		rtw89_mac_flush_txq(rtwdev, queues, drop);
+ }
+ 
++/*
++ * Without this, mac80211 flushes all queues when a station leaves, which
++ * stops TX to every station until the hardware queues drain.
++ */
++static void rtw89_ops_flush_sta(struct ieee80211_hw *hw,
++				struct ieee80211_vif *vif,
++				struct ieee80211_sta *sta)
++{
++	struct rtw89_sta *rtwsta = sta_to_rtwsta(sta);
++	struct rtw89_dev *rtwdev = hw->priv;
++	struct rtw89_sta_link *rtwsta_link;
++	unsigned int link_id;
++
++	lockdep_assert_wiphy(hw->wiphy);
++
++	if (RTW89_CHK_FW_FEATURE(NO_PACKET_DROP, &rtwdev->fw)) {
++		rtw89_ops_flush(hw, vif, BIT(hw->queues) - 1, false);
++		return;
++	}
++
++	rtw89_leave_lps(rtwdev);
++	rtw89_hci_flush_queues(rtwdev, BIT(hw->queues) - 1, true);
++
++	rtw89_sta_for_each_link(rtwsta, rtwsta_link, link_id)
++		rtw89_mac_pkt_drop_sta(rtwdev, rtwsta_link->rtwvif_link,
++				       rtwsta_link);
++}
++
+ struct rtw89_iter_bitrate_mask_data {
+ 	struct rtw89_dev *rtwdev;
+ 	struct ieee80211_vif *vif;
+@@ -2008,6 +2036,7 @@ const struct ieee80211_ops rtw89_ops = {
+ 	.set_rts_threshold	= rtw89_ops_set_rts_threshold,
+ 	.sta_statistics		= rtw89_ops_sta_statistics,
+ 	.flush			= rtw89_ops_flush,
++	.flush_sta		= rtw89_ops_flush_sta,
+ 	.set_bitrate_mask	= rtw89_ops_set_bitrate_mask,
+ 	.set_antenna		= rtw89_ops_set_antenna,
+ 	.get_antenna		= rtw89_ops_get_antenna,
