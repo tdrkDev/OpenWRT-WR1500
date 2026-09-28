@@ -1,0 +1,32 @@
+From: Roman Rikhter <teledurak@gmail.com>
+Subject: [PATCH] wifi: rtw89: align the bus part of the TX skb control block
+
+The bus keeps its part of the TX control block in hci_priv[] of struct
+rtw89_tx_skb_data: for PCI, the DMA address of the frame and the mapping
+of a frame sent from several buffers. hci_priv follows a pointer and two
+u8, so it starts at offset 6 on 32-bit systems, and every access to the
+DMA address and the mapping is misaligned. CPUs that don't handle
+misaligned accesses trap on each of them, and the kernel emulates the
+access: a frame takes four such traps on its way through the PCI bus,
+seven if it is sent from several buffers. On an RTL8197F (MIPS 24Kc)
+routing 230 Mbit/s to a station, the emulation took 0.5 % of the CPU.
+
+Align hci_priv to 8 bytes, which also suits a 64-bit dma_addr_t on a
+32-bit system. The PCI part then ends at 16 bytes on 32-bit systems and
+at 32 bytes on 64-bit ones, within the 40 bytes of driver_data.
+
+Signed-off-by: Roman Rikhter <teledurak@gmail.com>
+---
+diff --git drivers/net/wireless/realtek/rtw89/core.h drivers/net/wireless/realtek/rtw89/core.h
+index ac997dd..dc1edfb 100644
+--- a/drivers/net/wireless/realtek/rtw89/core.h
++++ b/drivers/net/wireless/realtek/rtw89/core.h
+@@ -3671,7 +3671,7 @@ struct rtw89_tx_skb_data {
+ 	struct rtw89_tx_wait_info __rcu *wait;
+ 	u8 tx_rpt_sn;
+ 	u8 tx_pkt_cnt_lmt;
+-	u8 hci_priv[];
++	u8 hci_priv[] __aligned(8);
+ };
+ 
+ #define RTW89_SCAN_NULL_TIMEOUT 30
