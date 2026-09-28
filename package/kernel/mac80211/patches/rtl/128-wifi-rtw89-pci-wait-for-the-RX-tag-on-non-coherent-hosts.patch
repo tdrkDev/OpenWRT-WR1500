@@ -1,0 +1,365 @@
+From: Roman Rikhter <teledurak@gmail.com>
+Subject: [PATCH] wifi: rtw89: pci: wait for the RX tag on non-coherent hosts
+
+The index of an RX ring can move before the buffers it covers are in
+memory. On a host whose DMA isn't coherent this is not rare: the vendor
+driver for the RTL8832BR on the RTL8197F (MIPS 24Kc) reads the tag of
+each RX and release report buffer through an uncached mapping before it
+uses the buffer, and tries again later when the tag isn't there yet.
+rtw89 checks the tag only on WiFi 7 chips, and the check can't work on
+such a host: the sync for the CPU does nothing on CPUs that don't
+prefetch, so the retries read the same cached line again. When they run
+out, the buffer is dropped, or with a release report buffer, all the
+buffers left in the batch, and the next tag is expected after the stale
+one.
+
+A stale release report buffer holds the reports of its previous use,
+which release frames that use the pages now and leave their own reports
+unread. A stale RX buffer is parsed as a frame.
+
+Drop the cached line before each read of the tag again, and when the tag
+doesn't come, leave the buffer for the next NAPI poll instead of
+dropping it; the other ring is still polled meanwhile. A tag that still
+isn't there one to two jiffies later is out of step: then drop the
+buffer without reading it, and continue from its tag. This also applies
+to the WiFi 7 chips, which checked the tag before: they now wait for a
+late buffer, and drop only that one when its tag doesn't come.
+
+The vendor driver runs the ring in separate mode, and it isn't known
+whether the RTL8832BR writes the tag in the packet mode that rtw89 uses.
+So on this chip, don't wait for tags until a ring saw a few of them in
+order, and say so once: a ring without tags works as it does now.
+
+Check the tag on the RTL8832BR. The disable_rx_tag_check parameter
+turns the check off at run time.
+
+Signed-off-by: Roman Rikhter <teledurak@gmail.com>
+---
+diff --git drivers/net/wireless/realtek/rtw89/pci.c drivers/net/wireless/realtek/rtw89/pci.c
+index 3aa6748..a31b91d 100644
+--- a/drivers/net/wireless/realtek/rtw89/pci.c
++++ b/drivers/net/wireless/realtek/rtw89/pci.c
+@@ -19,6 +19,10 @@ MODULE_PARM_DESC(disable_clkreq, "Set Y to disable PCI clkreq support");
+ MODULE_PARM_DESC(disable_aspm_l1, "Set Y to disable PCI ASPM L1 support");
+ MODULE_PARM_DESC(disable_aspm_l1ss, "Set Y to disable PCI L1SS support");
+ 
++static bool rtw89_pci_disable_rx_tag_check;
++module_param_named(disable_rx_tag_check, rtw89_pci_disable_rx_tag_check, bool, 0644);
++MODULE_PARM_DESC(disable_rx_tag_check, "Set Y to use RX buffers without checking their tag");
++
+ static int rtw89_pci_get_phy_offset_by_link_speed(struct rtw89_dev *rtwdev,
+ 						  u32 *phy_offset)
+ {
+@@ -196,30 +200,27 @@ static void rtw89_pci_rxbd_info_update(struct rtw89_dev *rtwdev,
+ 	rx_info->tag = le32_get_bits(info, RTW89_PCI_RXBD_TAG);
+ }
+ 
+-static int rtw89_pci_validate_rx_tag(struct rtw89_dev *rtwdev,
+-				     struct rtw89_pci_rx_ring *rx_ring,
+-				     struct sk_buff *skb)
++static u32 rtw89_pci_target_rx_tag(struct rtw89_pci_rx_ring *rx_ring)
+ {
+-	struct rtw89_pci_rx_info *rx_info = RTW89_PCI_RX_SKB_CB(skb);
+-	const struct rtw89_pci_info *info = rtwdev->pci_info;
+-	u32 target_rx_tag;
+-
+-	if (!info->check_rx_tag)
+-		return 0;
+-
+ 	/* valid range is 1 ~ 0x1FFF */
+-	if (rx_ring->target_rx_tag == 0)
+-		target_rx_tag = 1;
+-	else
+-		target_rx_tag = rx_ring->target_rx_tag;
++	return rx_ring->target_rx_tag ?: 1;
++}
+ 
+-	if (rx_info->tag != target_rx_tag) {
+-		rtw89_debug(rtwdev, RTW89_DBG_UNEXP, "mismatch RX tag 0x%x 0x%x\n",
+-			    rx_info->tag, target_rx_tag);
+-		return -EAGAIN;
+-	}
++/*
++ * On some hosts the index of a ring moves before its buffers are in
++ * memory, and the tag that the device writes into each buffer tells when
++ * they are. Where the tag is optional, a ring trusts the tags once they
++ * come in order: a chip that doesn't write them in the mode used here
++ * goes by the index alone.
++ */
++#define RTW89_PCI_RX_TAG_TRUST	8
++#define RTW89_PCI_RX_TAG_RETRY	100
+ 
+-	return 0;
++static bool rtw89_pci_rx_tag_trusted(struct rtw89_dev *rtwdev,
++				     struct rtw89_pci_rx_ring *rx_ring)
++{
++	return !rtwdev->pci_info->rx_tag_optional ||
++	       rx_ring->rx_tag_trust >= RTW89_PCI_RX_TAG_TRUST;
+ }
+ 
+ static
+@@ -228,22 +229,93 @@ int rtw89_pci_sync_skb_for_device_and_validate_rx_info(struct rtw89_dev *rtwdev,
+ 						       struct sk_buff *skb)
+ {
+ 	struct rtw89_pci_rx_info *rx_info = RTW89_PCI_RX_SKB_CB(skb);
+-	int rx_tag_retry = 1000;
+-	int ret;
++	const struct rtw89_pci_info *info = rtwdev->pci_info;
++	int rx_tag_retry = RTW89_PCI_RX_TAG_RETRY;
++
++	rtw89_pci_sync_skb_for_cpu(rtwdev, skb);
++	rtw89_pci_rxbd_info_update(rtwdev, skb);
+ 
+-	do {
++	if (!info->check_rx_tag || rtw89_pci_disable_rx_tag_check) {
++		rx_ring->rx_tag_trust = 0;
++		goto out;
++	}
++
++	if (rx_info->tag == rtw89_pci_target_rx_tag(rx_ring)) {
++		if (!rtw89_pci_rx_tag_trusted(rtwdev, rx_ring) &&
++		    ++rx_ring->rx_tag_trust == RTW89_PCI_RX_TAG_TRUST)
++			rtw89_info_once(rtwdev, "RX tags come in order, checking them\n");
++		goto out;
++	}
++
++	if (!rtw89_pci_rx_tag_trusted(rtwdev, rx_ring)) {
++		rx_ring->rx_tag_trust = 0;
++		goto out;
++	}
++
++	if (!rx_ring->rx_tag_wait)
++		rx_ring->rx_tag_late++;
++
++	while (rx_tag_retry--) {
++		/*
++		 * The sync for the CPU does nothing on CPUs that don't
++		 * prefetch, and the RXBD info read before stays in the cache:
++		 * drop it to read the one in memory.
++		 */
++		dma_sync_single_range_for_device(rtwdev->dev, rx_info->dma, 0,
++						 sizeof(struct rtw89_pci_rxbd_info),
++						 DMA_FROM_DEVICE);
+ 		rtw89_pci_sync_skb_for_cpu(rtwdev, skb);
+ 		rtw89_pci_rxbd_info_update(rtwdev, skb);
+ 
+-		ret = rtw89_pci_validate_rx_tag(rtwdev, rx_ring, skb);
+-		if (ret != -EAGAIN)
+-			break;
+-	} while (rx_tag_retry--);
++		if (rx_info->tag == rtw89_pci_target_rx_tag(rx_ring))
++			goto out;
++	}
++
++	rtw89_debug(rtwdev, RTW89_DBG_UNEXP, "mismatch RX tag 0x%x 0x%x\n",
++		    rx_info->tag, rtw89_pci_target_rx_tag(rx_ring));
++	return -EAGAIN;
++
++out:
++	rx_ring->rx_tag_wait = false;
+ 
+ 	/* update target rx_tag for next RX */
+ 	rx_ring->target_rx_tag = rx_info->tag + 1;
+ 
+-	return ret;
++	return 0;
++}
++
++/*
++ * Leave a buffer whose tag isn't there yet for the next poll. A tag that
++ * still isn't there one to two jiffies later isn't late: the tags are out
++ * of step. Then drop the buffer unread, and go by the tags of the device
++ * from there.
++ */
++static bool rtw89_pci_rx_tag_wait(struct rtw89_dev *rtwdev,
++				  struct rtw89_pci_rx_ring *rx_ring,
++				  struct sk_buff *skb)
++{
++	struct rtw89_pci_rx_info *rx_info = RTW89_PCI_RX_SKB_CB(skb);
++
++	if (!rx_ring->rx_tag_wait) {
++		rx_ring->rx_tag_wait = true;
++		rx_ring->rx_tag_wait_start = jiffies;
++		return true;
++	}
++
++	if (!time_after(jiffies, rx_ring->rx_tag_wait_start + 1))
++		return true;
++
++	rx_ring->rx_tag_dropped++;
++	rtw89_warn_ratelimited(rtwdev,
++			       "RX tag 0x%x instead of 0x%x, buffer dropped (%u of %u late)\n",
++			       rx_info->tag, rtw89_pci_target_rx_tag(rx_ring),
++			       rx_ring->rx_tag_dropped, rx_ring->rx_tag_late);
++
++	rx_ring->rx_tag_wait = false;
++	rx_ring->rx_tag_trust = 0;
++	rx_ring->target_rx_tag = rx_info->tag + 1;
++
++	return false;
+ }
+ 
+ static void rtw89_pci_ctrl_txdma_ch_ax(struct rtw89_dev *rtwdev, bool enable)
+@@ -420,8 +492,8 @@ static u32 rtw89_pci_rxbd_deliver_skbs(struct rtw89_dev *rtwdev,
+ 
+ 	ret = rtw89_pci_sync_skb_for_device_and_validate_rx_info(rtwdev, rx_ring, skb);
+ 	if (ret) {
+-		rtw89_err_ratelimited(rtwdev, "failed to update %d RXBD info: %d\n",
+-				      bd_ring->wp, ret);
++		if (rtw89_pci_rx_tag_wait(rtwdev, rx_ring, skb))
++			return 0;
+ 		goto err_sync_device;
+ 	}
+ 
+@@ -509,13 +581,9 @@ static void rtw89_pci_rxbd_deliver(struct rtw89_dev *rtwdev,
+ 
+ 	while (cnt && rtwdev->napi_budget_countdown > 0) {
+ 		rx_cnt = rtw89_pci_rxbd_deliver_skbs(rtwdev, rx_ring);
+-		if (!rx_cnt) {
+-			rtw89_err_ratelimited(rtwdev, "failed to deliver RXBD skb\n");
+-
+-			/* skip the rest RXBD bufs */
+-			rtw89_pci_rxbd_increase(rx_ring, cnt);
++		/* not in memory yet: the next poll takes it */
++		if (!rx_cnt)
+ 			break;
+-		}
+ 
+ 		cnt -= rx_cnt;
+ 	}
+@@ -792,9 +860,9 @@ static u32 rtw89_pci_release_tx_skbs(struct rtw89_dev *rtwdev,
+ 
+ 	ret = rtw89_pci_sync_skb_for_device_and_validate_rx_info(rtwdev, rx_ring, skb);
+ 	if (ret) {
+-		rtw89_err_ratelimited(rtwdev, "failed to update %d RXBD info: %d\n",
+-				      bd_ring->wp, ret);
+-		goto err_sync_device;
++		if (rtw89_pci_rx_tag_wait(rtwdev, rx_ring, skb))
++			return 0;
++		goto out;
+ 	}
+ 
+ 	/*
+@@ -823,33 +891,27 @@ out:
+ 	cnt++;
+ 
+ 	return cnt;
+-
+-err_sync_device:
+-	rtw89_pci_sync_skb_for_device(rtwdev, skb);
+-	return 0;
+ }
+ 
+-static void rtw89_pci_release_tx(struct rtw89_dev *rtwdev,
+-				 struct rtw89_pci_rx_ring *rx_ring,
+-				 u32 cnt)
++static u32 rtw89_pci_release_tx(struct rtw89_dev *rtwdev,
++				struct rtw89_pci_rx_ring *rx_ring,
++				u32 cnt)
+ {
+ 	struct rtw89_pci_dma_ring *bd_ring = &rx_ring->bd_ring;
+-	u32 release_cnt;
++	u32 release_cnt, left = cnt;
+ 
+-	while (cnt) {
+-		release_cnt = rtw89_pci_release_tx_skbs(rtwdev, rx_ring, cnt);
+-		if (!release_cnt) {
+-			rtw89_err_ratelimited(rtwdev, "failed to release TX skbs\n");
+-
+-			/* skip the rest RXBD bufs */
+-			rtw89_pci_rxbd_increase(rx_ring, cnt);
++	while (left) {
++		release_cnt = rtw89_pci_release_tx_skbs(rtwdev, rx_ring, left);
++		/* not in memory yet: the next poll takes it */
++		if (!release_cnt)
+ 			break;
+-		}
+ 
+-		cnt -= release_cnt;
++		left -= release_cnt;
+ 	}
+ 
+ 	rtw89_write16(rtwdev, bd_ring->addr.idx, bd_ring->wp);
++
++	return cnt - left;
+ }
+ 
+ static int rtw89_pci_poll_rpq_dma(struct rtw89_dev *rtwdev,
+@@ -867,7 +929,7 @@ static int rtw89_pci_poll_rpq_dma(struct rtw89_dev *rtwdev,
+ 	if (cnt == 0)
+ 		goto out_unlock;
+ 
+-	rtw89_pci_release_tx(rtwdev, rx_ring, cnt);
++	cnt = rtw89_pci_release_tx(rtwdev, rx_ring, cnt);
+ 
+ out_unlock:
+ 	spin_unlock_bh(&rtwpci->trx_lock);
+@@ -2149,6 +2211,8 @@ static void rtw89_pci_reset_trx_rings(struct rtw89_dev *rtwdev)
+ 		rx_ring->diliver_skb = NULL;
+ 		rx_ring->diliver_desc.ready = false;
+ 		rx_ring->target_rx_tag = 0;
++		rx_ring->rx_tag_trust = 0;
++		rx_ring->rx_tag_wait = false;
+ 
+ 		if (info->group_bd_addr) {
+ 			if (addr_desa_l)
+@@ -4029,6 +4093,8 @@ static int rtw89_pci_alloc_rx_ring(struct rtw89_dev *rtwdev,
+ 	rx_ring->diliver_skb = NULL;
+ 	rx_ring->diliver_desc.ready = false;
+ 	rx_ring->target_rx_tag = 0;
++	rx_ring->rx_tag_trust = 0;
++	rx_ring->rx_tag_wait = false;
+ 
+ 	for (i = 0; i < len; i++) {
+ 		if (rx_ring->page_buf)
+@@ -4857,6 +4923,12 @@ static int rtw89_pci_napi_poll(struct napi_struct *napi, int budget)
+ 
+ 	rtw89_write32(rtwdev, isr_def->isr_clear_rxq.addr, isr_def->isr_clear_rxq.data);
+ 	work_done += rtw89_pci_poll_rxq_dma(rtwdev, rtwpci, rtwdev->napi_budget_countdown);
++
++	/* poll again for a buffer that isn't in memory yet */
++	if (unlikely(rtwpci->rx.rings[RTW89_RXCH_RXQ].rx_tag_wait ||
++		     rtwpci->rx.rings[RTW89_RXCH_RPQ].rx_tag_wait))
++		return budget;
++
+ 	if (work_done < budget && napi_complete_done(napi, work_done)) {
+ 		spin_lock_irqsave(&rtwpci->irq_lock, flags);
+ 		if (likely(rtwpci->running))
+diff --git drivers/net/wireless/realtek/rtw89/pci.h drivers/net/wireless/realtek/rtw89/pci.h
+index 38c7552..be72264 100644
+--- a/drivers/net/wireless/realtek/rtw89/pci.h
++++ b/drivers/net/wireless/realtek/rtw89/pci.h
+@@ -1409,6 +1409,7 @@ struct rtw89_pci_info {
+ 	enum mac_ax_io_rcy_tmr io_rcy_tmr;
+ 	bool rx_ring_eq_is_full;
+ 	bool check_rx_tag;
++	bool rx_tag_optional;
+ 	bool no_rxbd_fs;
+ 	bool group_bd_addr;
+ 	bool min_intr_mask;
+@@ -1636,6 +1637,11 @@ struct rtw89_pci_rx_ring {
+ 	struct sk_buff *diliver_skb;
+ 	struct rtw89_rx_desc_info diliver_desc;
+ 	u32 target_rx_tag:13;
++	u8 rx_tag_trust;
++	bool rx_tag_wait;
++	unsigned long rx_tag_wait_start;
++	u32 rx_tag_late;
++	u32 rx_tag_dropped;
+ };
+ 
+ struct rtw89_pci_rx_rings {
+diff --git drivers/net/wireless/realtek/rtw89/rtw8852ce.c drivers/net/wireless/realtek/rtw89/rtw8852ce.c
+index d903a0d..41ebc30 100644
+--- a/drivers/net/wireless/realtek/rtw89/rtw8852ce.c
++++ b/drivers/net/wireless/realtek/rtw89/rtw8852ce.c
+@@ -94,7 +94,8 @@ static const struct rtw89_pci_info rtw8832br_pci_info = {
+ 	.io_rcy_en		= MAC_AX_PCIE_ENABLE,
+ 	.io_rcy_tmr		= MAC_AX_IO_RCY_ANA_TMR_6MS,
+ 	.rx_ring_eq_is_full	= false,
+-	.check_rx_tag		= false,
++	.check_rx_tag		= true,	/* SoC hosts see the index before the data */
++	.rx_tag_optional	= true,
+ 	.no_rxbd_fs		= false,
+ 	.group_bd_addr		= false,
+ 	.min_intr_mask		= true,
