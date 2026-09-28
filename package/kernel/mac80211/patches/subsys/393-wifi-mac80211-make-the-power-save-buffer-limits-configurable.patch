@@ -1,0 +1,304 @@
+From: Roman Rikhter <teledurak@gmail.com>
+Subject: [PATCH] wifi: mac80211: make the power save buffer limits
+ configurable
+
+Frames for a station in power save wait in its PS buffer when the driver
+doesn't buffer them itself, and mac80211 keeps at most 64 frames per AC
+there, dropping the oldest one for a new one, and 512 frames in total.
+Clients doze often during downloads, for example a laptop that scans or
+keeps a peer-to-peer link: one seen here is away for about 90 ms twice a
+second, plus many dozes below 10 ms. At 20 Mbit/s 64 frames last 40 ms,
+so every longer doze loses frames, silently: a UDP stream of 30 Mbit/s
+to such a client lost 28-45 % of its packets, and TCP from the WAN
+reached 25 Mbit/s. In a test with 2048 frames per AC, where the driver
+also paused the station in the hardware, the loss was gone and TCP
+reached 90 Mbit/s.
+
+The buffer isn't free, though: its frames are outside the memory limit
+of the TX queues, and when the station wakes up, all of them go through
+the TX path again at once, in one run of the pending tasklet, and then
+to the TX queues of the station. Raise the limits moderately, to 256
+frames per AC and 1024 in total, and bound the memory of the unicast
+frames of all stations to 2 MiB of truesize, well below the memory
+limit of the TX queues; the limits in frames alone would allow 16 MiB
+for 16 KiB receive buffers. When a limit is reached, the oldest frames
+are dropped as before. Make the limits configurable, and count the
+frames dropped, in debugfs:
+
+  ps_buffer/ac_limit      frames per station and AC
+  ps_buffer/total_limit   frames of all stations, including multicast
+  ps_buffer/bytes_limit   truesize of the unicast frames of all stations
+  ps_buffer/bytes         truesize buffered now
+  ps_buffer/dropped       frames dropped for the limit per AC
+  ps_buffer/purged        frames dropped for the other limits
+  ps_buffer/expired       frames dropped when their station didn't poll
+
+The old limits are 64, 512 and 4294967295.
+
+Signed-off-by: Roman Rikhter <teledurak@gmail.com>
+---
+diff --git net/mac80211/debugfs.c net/mac80211/debugfs.c
+index 622d710..ba2eeca 100644
+--- a/net/mac80211/debugfs.c
++++ b/net/mac80211/debugfs.c
+@@ -667,7 +667,7 @@ DEBUGFS_DEVSTATS_FILE(dot11RTSSuccessCount);
+ void debugfs_hw_add(struct ieee80211_local *local)
+ {
+ 	struct dentry *phyd = local->hw.wiphy->debugfsdir;
+-	struct dentry *statsd;
++	struct dentry *statsd, *psd;
+ 
+ 	if (!phyd)
+ 		return;
+@@ -697,6 +697,15 @@ void debugfs_hw_add(struct ieee80211_local *local)
+ 	debugfs_create_u32("aql_threshold", 0600,
+ 			   phyd, &local->aql_threshold);
+ 
++	psd = debugfs_create_dir("ps_buffer", phyd);
++	debugfs_create_u32("ac_limit", 0600, psd, &local->ps_buf.ac_limit);
++	debugfs_create_u32("total_limit", 0600, psd, &local->ps_buf.total_limit);
++	debugfs_create_u32("bytes_limit", 0600, psd, &local->ps_buf.bytes_limit);
++	debugfs_create_atomic_t("bytes", 0400, psd, &local->ps_buf.bytes);
++	debugfs_create_u32("dropped", 0400, psd, &local->ps_buf.dropped);
++	debugfs_create_u32("purged", 0400, psd, &local->ps_buf.purged);
++	debugfs_create_u32("expired", 0400, psd, &local->ps_buf.expired);
++
+ 	statsd = debugfs_create_dir("statistics", phyd);
+ 
+ #ifdef CPTCFG_MAC80211_DEBUG_COUNTERS
+diff --git net/mac80211/ieee80211_i.h net/mac80211/ieee80211_i.h
+index 551eb2d..756171b 100644
+--- a/net/mac80211/ieee80211_i.h
++++ b/net/mac80211/ieee80211_i.h
+@@ -45,10 +45,15 @@ struct ieee80211_mesh_fast_tx;
+  * associated stations are using power saving. */
+ #define AP_MAX_BC_BUFFER 128
+ 
+-/* Maximum number of frames buffered to all STAs, including multicast frames.
+- * Note: increasing this limit increases the potential memory requirement. Each
+- * frame can be up to about 2 kB long. */
+-#define TOTAL_MAX_TX_BUFFER 512
++/* Default limits of the frames buffered for power saving STAs: per STA and
++ * AC, for all STAs including multicast frames, and the memory taken by the
++ * unicast frames. All frames of a STA are sent again at once when it wakes
++ * up, and go to its TX queues: keep the memory well below the default
++ * memory limit of the TX queues. The limits can be changed in debugfs.
++ */
++#define IEEE80211_PS_BUF_AC_LIMIT	256
++#define IEEE80211_PS_BUF_TOTAL_LIMIT	1024
++#define IEEE80211_PS_BUF_BYTES_LIMIT	(2 << 20)
+ 
+ /* Required encryption head and tailroom */
+ #define IEEE80211_ENCRYPT_HEADROOM 8
+@@ -1674,6 +1679,16 @@ struct ieee80211_local {
+ 	int total_ps_buffered; /* total number of all buffered unicast and
+ 				* multicast packets for power saving stations
+ 				*/
++	struct {
++		/* limits */
++		u32 ac_limit, total_limit, bytes_limit;
++		/* truesize of the unicast frames */
++		atomic_t bytes;
++		/* frames dropped for the limit per AC, for the others,
++		 * and after STA_TX_BUFFER_EXPIRE
++		 */
++		u32 dropped, purged, expired;
++	} ps_buf;
+ 
+ 	bool pspolling;
+ 	/*
+diff --git net/mac80211/main.c net/mac80211/main.c
+index f9324fc..7430232 100644
+--- a/net/mac80211/main.c
++++ b/net/mac80211/main.c
+@@ -1002,6 +1002,10 @@ struct ieee80211_hw *ieee80211_alloc_hw_nm(size_t priv_data_len,
+ 	local->aql_threshold = IEEE80211_AQL_THRESHOLD;
+ 	atomic_set(&local->aql_total_pending_airtime, 0);
+ 
++	local->ps_buf.ac_limit = IEEE80211_PS_BUF_AC_LIMIT;
++	local->ps_buf.total_limit = IEEE80211_PS_BUF_TOTAL_LIMIT;
++	local->ps_buf.bytes_limit = IEEE80211_PS_BUF_BYTES_LIMIT;
++
+ 	spin_lock_init(&local->handle_wake_tx_queue_lock);
+ 
+ 	INIT_LIST_HEAD(&local->chanctx_list);
+diff --git net/mac80211/mesh_ps.c net/mac80211/mesh_ps.c
+index ebab1f0..fec436b 100644
+--- a/net/mac80211/mesh_ps.c
++++ b/net/mac80211/mesh_ps.c
+@@ -470,8 +470,13 @@ static void mps_frame_deliver(struct sta_info *sta, int n_frames)
+ 			if (!skb) {
+ 				skb = skb_dequeue(
+ 					&sta->ps_tx_buf[ac]);
+-				if (skb)
++				if (skb) {
+ 					local->total_ps_buffered--;
++					atomic_sub(skb->truesize,
++						   &sta->ps_tx_buf_bytes);
++					atomic_sub(skb->truesize,
++						   &local->ps_buf.bytes);
++				}
+ 			}
+ 			if (!skb)
+ 				break;
+diff --git net/mac80211/sta_info.c net/mac80211/sta_info.c
+index b5b9994..b5ecf14 100644
+--- a/net/mac80211/sta_info.c
++++ b/net/mac80211/sta_info.c
+@@ -162,6 +162,7 @@ static void __cleanup_single_sta(struct sta_info *sta)
+ 		ieee80211_purge_tx_queue(&local->hw, &sta->ps_tx_buf[ac]);
+ 		ieee80211_purge_tx_queue(&local->hw, &sta->tx_filtered[ac]);
+ 	}
++	atomic_sub(atomic_xchg(&sta->ps_tx_buf_bytes, 0), &local->ps_buf.bytes);
+ 
+ 	if (ieee80211_vif_is_mesh(&sdata->vif))
+ 		mesh_sta_cleanup(sta);
+@@ -1274,6 +1275,9 @@ static bool sta_info_cleanup_expire_buffered_ac(struct ieee80211_local *local,
+ 			break;
+ 
+ 		local->total_ps_buffered--;
++		atomic_sub(skb->truesize, &sta->ps_tx_buf_bytes);
++		atomic_sub(skb->truesize, &local->ps_buf.bytes);
++		local->ps_buf.expired++;
+ 		ps_dbg(sta->sdata, "Buffered frame expired (STA %pM)\n",
+ 		       sta->sta.addr);
+ 		ieee80211_free_txskb(&local->hw, skb);
+@@ -1835,7 +1839,7 @@ void ieee80211_sta_ps_deliver_wakeup(struct sta_info *sta)
+ 	struct ieee80211_sub_if_data *sdata = sta->sdata;
+ 	struct ieee80211_local *local = sdata->local;
+ 	struct sk_buff_head pending;
+-	int filtered = 0, buffered = 0, ac, i;
++	int filtered = 0, buffered = 0, buffered_bytes, ac, i;
+ 	unsigned long flags;
+ 	struct ps_data *ps;
+ 
+@@ -1887,6 +1891,7 @@ void ieee80211_sta_ps_deliver_wakeup(struct sta_info *sta)
+ 		tmp = skb_queue_len(&pending);
+ 		buffered += tmp - count;
+ 	}
++	buffered_bytes = atomic_xchg(&sta->ps_tx_buf_bytes, 0);
+ 
+ 	ieee80211_add_pending_skbs(local, &pending);
+ 
+@@ -1903,6 +1908,7 @@ void ieee80211_sta_ps_deliver_wakeup(struct sta_info *sta)
+ 	atomic_dec(&ps->num_sta_ps);
+ 
+ 	local->total_ps_buffered -= buffered;
++	atomic_sub(buffered_bytes, &local->ps_buf.bytes);
+ 
+ 	sta_info_recalc_tim(sta);
+ 
+@@ -2079,8 +2085,13 @@ ieee80211_sta_ps_get_frames(struct sta_info *sta, int n_frames, u8 ignored_acs,
+ 				if (!skb) {
+ 					skb = skb_dequeue(
+ 						&sta->ps_tx_buf[ac]);
+-					if (skb)
++					if (skb) {
+ 						local->total_ps_buffered--;
++						atomic_sub(skb->truesize,
++							   &sta->ps_tx_buf_bytes);
++						atomic_sub(skb->truesize,
++							   &local->ps_buf.bytes);
++					}
+ 				}
+ 				if (!skb)
+ 					break;
+diff --git net/mac80211/sta_info.h net/mac80211/sta_info.h
+index 8e285d7..fbf00d1 100644
+--- a/net/mac80211/sta_info.h
++++ b/net/mac80211/sta_info.h
+@@ -661,6 +661,7 @@ struct ieee80211_sta_removed_link_stats {
+  * @ps_lock: used for powersave (when mac80211 is the AP) related locking
+  * @ps_tx_buf: buffers (per AC) of frames to transmit to this station
+  *	when it leaves power saving state or polls
++ * @ps_tx_buf_bytes: truesize of the frames on @ps_tx_buf
+  * @tx_filtered: buffers (per AC) of frames we already tried to
+  *	transmit but were filtered by hardware due to STA having
+  *	entered power saving state, these are also delivered to
+@@ -751,6 +752,7 @@ struct sta_info {
+ 	/* STA powersave lock and frame queues */
+ 	spinlock_t ps_lock;
+ 	struct sk_buff_head ps_tx_buf[IEEE80211_NUM_ACS];
++	atomic_t ps_tx_buf_bytes;
+ 	struct sk_buff_head tx_filtered[IEEE80211_NUM_ACS];
+ 	unsigned long driver_buffered_tids;
+ 	unsigned long txq_buffered_tids;
+diff --git net/mac80211/tx.c net/mac80211/tx.c
+index f55c0c1..a181a1b 100644
+--- a/net/mac80211/tx.c
++++ b/net/mac80211/tx.c
+@@ -323,6 +323,15 @@ ieee80211_tx_h_check_assoc(struct ieee80211_tx_data *tx)
+ 	return TX_CONTINUE;
+ }
+ 
++static bool ieee80211_ps_buf_full(struct ieee80211_local *local)
++{
++	int total = local->total_ps_buffered;
++	int bytes = atomic_read(&local->ps_buf.bytes);
++
++	return (total > 0 && (u32)total >= READ_ONCE(local->ps_buf.total_limit)) ||
++	       (bytes > 0 && (u32)bytes >= READ_ONCE(local->ps_buf.bytes_limit));
++}
++
+ /* This function is called whenever the AP is about to exceed the maximum limit
+  * of buffered frames for power saving STAs. This situation should not really
+  * happen often during normal operation, so dropping the oldest buffered packet
+@@ -363,6 +372,8 @@ static void purge_old_ps_buffers(struct ieee80211_local *local)
+ 			skb = skb_dequeue(&sta->ps_tx_buf[ac]);
+ 			total += skb_queue_len(&sta->ps_tx_buf[ac]);
+ 			if (skb) {
++				atomic_sub(skb->truesize, &sta->ps_tx_buf_bytes);
++				atomic_sub(skb->truesize, &local->ps_buf.bytes);
+ 				purged++;
+ 				ieee80211_free_txskb(&local->hw, skb);
+ 				break;
+@@ -371,6 +382,7 @@ static void purge_old_ps_buffers(struct ieee80211_local *local)
+ 	}
+ 
+ 	local->total_ps_buffered = total;
++	local->ps_buf.purged += purged;
+ 	ps_dbg_hw(&local->hw, "PS buffers full - purged %d frames\n", purged);
+ }
+ 
+@@ -424,7 +436,7 @@ ieee80211_tx_h_multicast_ps_buf(struct ieee80211_tx_data *tx)
+ 		return TX_CONTINUE;
+ 
+ 	/* buffered in mac80211 */
+-	if (tx->local->total_ps_buffered >= TOTAL_MAX_TX_BUFFER)
++	if (ieee80211_ps_buf_full(tx->local))
+ 		purge_old_ps_buffers(tx->local);
+ 
+ 	if (skb_queue_len(&ps->bc_buf) >= AP_MAX_BC_BUFFER) {
+@@ -479,7 +491,7 @@ ieee80211_tx_h_unicast_ps_buf(struct ieee80211_tx_data *tx)
+ 
+ 		ps_dbg(sta->sdata, "STA %pM aid %d: PS buffer for AC %d\n",
+ 		       sta->sta.addr, sta->sta.aid, ac);
+-		if (tx->local->total_ps_buffered >= TOTAL_MAX_TX_BUFFER)
++		if (ieee80211_ps_buf_full(local))
+ 			purge_old_ps_buffers(tx->local);
+ 
+ 		/* sync with ieee80211_sta_ps_deliver_wakeup */
+@@ -496,15 +508,22 @@ ieee80211_tx_h_unicast_ps_buf(struct ieee80211_tx_data *tx)
+ 			return TX_CONTINUE;
+ 		}
+ 
+-		if (skb_queue_len(&sta->ps_tx_buf[ac]) >= STA_MAX_TX_BUFFER) {
++		if (skb_queue_len(&sta->ps_tx_buf[ac]) >=
++		    max(READ_ONCE(local->ps_buf.ac_limit), 1U)) {
+ 			struct sk_buff *old = skb_dequeue(&sta->ps_tx_buf[ac]);
+ 			ps_dbg(tx->sdata,
+ 			       "STA %pM TX buffer for AC %d full - dropping oldest frame\n",
+ 			       sta->sta.addr, ac);
++			atomic_sub(old->truesize, &sta->ps_tx_buf_bytes);
++			atomic_sub(old->truesize, &local->ps_buf.bytes);
++			local->ps_buf.dropped++;
+ 			ieee80211_free_txskb(&local->hw, old);
+ 		} else
+ 			tx->local->total_ps_buffered++;
+ 
++		atomic_add(tx->skb->truesize, &sta->ps_tx_buf_bytes);
++		atomic_add(tx->skb->truesize, &local->ps_buf.bytes);
++
+ 		info->control.jiffies = jiffies;
+ 		info->control.vif = &tx->sdata->vif;
+ 		info->control.flags |= IEEE80211_TX_INTCFL_NEED_TXPROCESSING;
