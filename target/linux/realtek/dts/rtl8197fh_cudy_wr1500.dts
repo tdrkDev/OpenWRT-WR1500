@@ -27,6 +27,26 @@
 		reg = <0x0 0x8000000>;
 	};
 
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		/*
+		 * Kept across the watchdog reset, which also reboots the SoC:
+		 * the boot code stays in the first 32 MiB, and rt-loader moves
+		 * itself to the end of RAM, above this for images up to 15 MiB
+		 */
+		ramoops@7000000 {
+			compatible = "ramoops";
+			reg = <0x7000000 0x28000>;
+			record-size = <0x8000>;
+			console-size = <0x8000>;
+			pmsg-size = <0x10000>;
+			ecc-size = <16>;
+		};
+	};
+
 	/*
 	 * CPU clock chosen with luci-app-cpuclk, applied at boot unless the
 	 * WPS button is held

@@ -57,8 +57,9 @@ define Device/cudy_wr1500
   DEVICE_VENDOR := Cudy
   DEVICE_MODEL := WR1500
   SUPPORTED_DEVICES += R76
-  DEVICE_PACKAGES := cudy-bdinfo-read kmod-dsa-rtl8365mb kmod-rtw88-8197ge \
-	kmod-rtw89-8852ce rtw8832br-firmware wpad-basic-mbedtls -uboot-envtools
+  DEVICE_PACKAGES := cudy-bdinfo-read kmod-dsa-rtl8365mb kmod-ramoops \
+	kmod-rtw88-8197ge kmod-rtw89-8852ce rtw8832br-firmware \
+	wpad-basic-mbedtls -uboot-envtools
   KERNEL := $$(KERNEL/rt-loader) | realtek-cvimg 0x40000 | uImage none
   IMAGE_SIZE := 16000k
   IMAGES += recovery.bin
