@@ -1,0 +1,151 @@
+From: Roman Rikhter <teledurak@gmail.com>
+Subject: [PATCH] wifi: rtw89: pci: ignore stale release reports
+
+The sequence number that a release report returns is the index of the WD
+page, and nothing tells one use of a page from the next. When a report
+is read twice, or an old one is read from a release report buffer that
+the device hasn't written again yet, it releases the frame that uses the
+page now: that frame is unmapped and reported as sent, possibly before
+the DMA fetched it, and its own report later finds nothing to release.
+If the page is free, the report only warns that the page isn't idle.
+
+The release report returns all 15 bits of the sequence number, and the
+vendor driver for the RTL8832BR uses 12 of them. On this chip, count the
+uses of each page in the 3 bits above the index, and ignore a report
+whose count doesn't match the page. On all chips, ignore a report whose
+page has no frame; the others keep 0 in these bits, so a report with
+bits set there is ignored too, as it was before.
+
+Signed-off-by: Roman Rikhter <teledurak@gmail.com>
+---
+diff --git drivers/net/wireless/realtek/rtw89/pci.c drivers/net/wireless/realtek/rtw89/pci.c
+index 86bf361..3aa6748 100644
+--- a/drivers/net/wireless/realtek/rtw89/pci.c
++++ b/drivers/net/wireless/realtek/rtw89/pci.c
+@@ -712,6 +712,7 @@ static void rtw89_pci_release_rpp(struct rtw89_dev *rtwdev, void *rpp)
+ 	struct rtw89_pci_tx_wd_ring *wd_ring;
+ 	struct rtw89_pci_tx_ring *tx_ring;
+ 	struct rtw89_pci_tx_wd *txwd;
++	u32 idx;
+ 
+ 	info->parse_rpp(rtwdev, rpp, &rpp_info);
+ 
+@@ -722,16 +723,32 @@ static void rtw89_pci_release_rpp(struct rtw89_dev *rtwdev, void *rpp)
+ 		return;
+ 	}
+ 
+-	if (unlikely(rpp_info.seq >= RTW89_PCI_TXWD_NUM_MAX)) {
++	tx_ring = &rtwpci->tx.rings[rpp_info.txch];
++	wd_ring = &tx_ring->wd_ring;
++	idx = FIELD_GET(RTW89_PCI_TXWP_SEQ_IDX, rpp_info.seq);
++
++	if (unlikely(idx >= wd_ring->page_num ||
++		     rpp_info.seq & ~(RTW89_PCI_TXWP_SEQ_GEN | RTW89_PCI_TXWP_SEQ_IDX))) {
+ 		rtw89_warn_ratelimited(rtwdev, "invalid seq %d\n", rpp_info.seq);
+ 		return;
+ 	}
+ 
+-	tx_ring = &rtwpci->tx.rings[rpp_info.txch];
+-	wd_ring = &tx_ring->wd_ring;
+-	txwd = &wd_ring->pages[rpp_info.seq];
++	txwd = &wd_ring->pages[idx];
++
++	/*
++	 * A report for an earlier use of the page, or one that came twice,
++	 * must not release the frame that uses the page now.
++	 */
++	if (unlikely(FIELD_GET(RTW89_PCI_TXWP_SEQ_GEN, rpp_info.seq) != txwd->gen ||
++		     skb_queue_empty(&txwd->queue))) {
++		tx_ring->tx_stale_rpp++;
++		rtw89_warn_ratelimited(rtwdev,
++				       "queue %d txwd %d: stale release report (%llu)\n",
++				       rpp_info.txch, idx, tx_ring->tx_stale_rpp);
++		return;
++	}
+ 
+-	rtw89_pci_release_txwd_skb(rtwdev, tx_ring, txwd, rpp_info.seq,
++	rtw89_pci_release_txwd_skb(rtwdev, tx_ring, txwd, idx,
+ 				   rpp_info.tx_status);
+ }
+ 
+@@ -1789,8 +1806,13 @@ static int rtw89_pci_txwd_submit(struct rtw89_dev *rtwdev,
+ 	txwd_len = chip->txwd_body_size;
+ 	txwd_len += en_wd_info ? chip->txwd_info_size : 0;
+ 
++	if (rtwdev->pci_info->wp_seq_gen)
++		txwd->gen = (txwd->gen + 1) % RTW89_PCI_TXWP_SEQ_GEN_NUM;
++
+ 	txwp_info = txwd->vaddr + txwd_len;
+-	txwp_info->seq0 = cpu_to_le16(txwd->seq | RTW89_PCI_TXWP_VALID);
++	txwp_info->seq0 = cpu_to_le16(FIELD_PREP(RTW89_PCI_TXWP_SEQ_IDX, txwd->seq) |
++				      FIELD_PREP(RTW89_PCI_TXWP_SEQ_GEN, txwd->gen) |
++				      RTW89_PCI_TXWP_VALID);
+ 	txwp_info->seq1 = 0;
+ 	txwp_info->seq2 = 0;
+ 	txwp_info->seq3 = 0;
+@@ -3835,6 +3857,8 @@ static int rtw89_pci_alloc_tx_wd_ring(struct rtw89_dev *rtwdev,
+ 	u32 page_offset;
+ 	int i;
+ 
++	BUILD_BUG_ON(FIELD_MAX(RTW89_PCI_TXWP_SEQ_IDX) + 1 < RTW89_PCI_TXWD_NUM_MAX);
++
+ 	/* FWCMD queue doesn't use txwd as pages */
+ 	if (txch == RTW89_TXCH_CH12)
+ 		return 0;
+diff --git drivers/net/wireless/realtek/rtw89/pci.h drivers/net/wireless/realtek/rtw89/pci.h
+index 57bc504..38c7552 100644
+--- a/drivers/net/wireless/realtek/rtw89/pci.h
++++ b/drivers/net/wireless/realtek/rtw89/pci.h
+@@ -1412,6 +1412,7 @@ struct rtw89_pci_info {
+ 	bool no_rxbd_fs;
+ 	bool group_bd_addr;
+ 	bool min_intr_mask;
++	bool wp_seq_gen;
+ 	u32 rpp_fmt_size;
+ 
+ 	u32 init_cfg_reg;
+@@ -1474,6 +1475,16 @@ struct rtw89_pci_tx_bd_32 {
+ 
+ #define RTW89_PCI_TXWP_VALID		BIT(15)
+ 
++/*
++ * The release report of a WD page returns its sequence number. The low
++ * bits are the index of the page; with wp_seq_gen, the next ones count
++ * the uses of the page, to tell a report from an earlier use. The vendor
++ * driver uses 12 bits, but not 0xfff.
++ */
++#define RTW89_PCI_TXWP_SEQ_IDX		GENMASK(8, 0)
++#define RTW89_PCI_TXWP_SEQ_GEN		GENMASK(11, 9)
++#define RTW89_PCI_TXWP_SEQ_GEN_NUM	7
++
+ struct rtw89_pci_tx_wp_info {
+ 	__le16 seq0;
+ 	__le16 seq1;
+@@ -1561,6 +1572,7 @@ struct rtw89_pci_tx_wd {
+ 	dma_addr_t paddr;
+ 	u32 len;
+ 	u32 seq;
++	u8 gen;
+ };
+ 
+ struct rtw89_pci_dma_ring {
+@@ -1608,6 +1620,7 @@ struct rtw89_pci_tx_ring {
+ 	u64 tx_retry_lmt;
+ 	u64 tx_life_time;
+ 	u64 tx_mac_id_drop;
++	u64 tx_stale_rpp;
+ };
+ 
+ struct rtw89_pci_tx_rings {
+diff --git drivers/net/wireless/realtek/rtw89/rtw8852ce.c drivers/net/wireless/realtek/rtw89/rtw8852ce.c
+index 1eef34d..d903a0d 100644
+--- a/drivers/net/wireless/realtek/rtw89/rtw8852ce.c
++++ b/drivers/net/wireless/realtek/rtw89/rtw8852ce.c
+@@ -98,6 +98,7 @@ static const struct rtw89_pci_info rtw8832br_pci_info = {
+ 	.no_rxbd_fs		= false,
+ 	.group_bd_addr		= false,
+ 	.min_intr_mask		= true,
++	.wp_seq_gen		= true,
+ 	.rpp_fmt_size		= sizeof(struct rtw89_pci_rpp_fmt),
+ 
+ 	.init_cfg_reg		= R_AX_HAXI_INIT_CFG1,
